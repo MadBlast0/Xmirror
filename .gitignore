@@ -5,7 +5,6 @@
 /release/
 
 # Local repository metadata and IDE files
-/Xmirror/
 .idea/
 .vs/
 
