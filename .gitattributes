@@ -1,2 +1,18 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Keep source and documentation consistent across platforms.
+* text=auto eol=lf
+
+# Windows scripts use their native line ending when checked out.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Do not diff or normalize binary assets and packages.
+*.dll binary
+*.exe binary
+*.ico binary
+*.lib binary
+*.msi binary
+*.obj binary
+*.pdb binary
+*.png binary
+*.zip binary

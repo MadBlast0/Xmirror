@@ -1,12 +1,28 @@
-build/*
-out/
-.wix/
-release/
+# Build and packaging output
+/build/
+/out/
+/.wix/
+/release/
+
+# Local repository metadata and IDE files
 /Xmirror/
 .idea/
+.vs/
+
+# Bundled SDK and generated Windows artifacts
 Bonjour SDK/
 dnssd.dll
+*.dll
+*.exe
+*.lib
+*.msi
+*.obj
+*.pdb
+*.zip
+
+# Python caches and local reports
 __pycache__/
+*.py[cod]
 
 # local safety copies and test reports
 *.bak
