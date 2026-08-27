@@ -2,6 +2,7 @@ build/*
 out/
 .wix/
 release/
+/Xmirror/
 .idea/
 Bonjour SDK/
 dnssd.dll
