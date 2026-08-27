@@ -1,0 +1,240 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+     
+  <!-- version number is major.minor.zero.enginebuild -->
+  <Package
+    Id="XMirror"
+    Name="XMirror"
+    Manufacturer="MadBlast"
+    Version="2.1.0.1736"
+    UpgradeCode="00000eaf-dcca-458f-ab77-aaef11ce4ba8"
+    Language="1033"
+    Scope="perMachine">
+
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of XMirror is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Without ARPPRODUCTICON, Add/Remove Programs falls back to a generic
+         package icon. Also used by the installer UI's title bar. -->
+    <!-- The Id extension matters: Windows Installer infers the stream type from
+         it. An ".exe" Id makes it look for an icon resource inside a PE image,
+         which a raw .ico is not, and DisplayIcon is then left empty. -->
+    <Icon Id="XMirrorIcon.ico" SourceFile="./stuff/XMirror.ico" />
+    <Property Id="ARPPRODUCTICON" Value="XMirrorIcon.ico" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/MadBlast0/XMirror" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/MadBlast0/XMirror" />
+
+    <ui:WixUI Id="WixUI_FeatureTree" />
+
+    <!-- Skip the licence-agreement page: route Welcome straight to the feature
+         tree, and Back straight home again. Higher Order wins over the stock
+         WixUI_FeatureTree publishes, so the dialog is simply never reached. -->
+    <UI>
+      <Publish Dialog="WelcomeDlg" Control="Next"
+               Event="NewDialog" Value="CustomizeDlg" Order="10" />
+      <Publish Dialog="CustomizeDlg" Control="Back"
+               Event="NewDialog" Value="WelcomeDlg" Order="10" />
+    </UI>
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLDIR" Name="XMirror" />
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="XMirror" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentGroupRef Id="AppExe" />
+      <ComponentRef Id="ProgramMenuShortcutComponent" />
+      <ComponentRef Id="UserDataCleanupComponent" />
+      <ComponentRef Id="LegacyMadMirrorCleanupComponent" />
+      <ComponentRef Id="LegacyMadAirPlayCleanupComponent" />
+    </Feature>
+
+    <Feature
+      Id="DesktopShortcuts"
+      Title="Desktop Shortcut"
+      Description="Create a shortcut on the desktop"
+      Level="1">
+      <ComponentRef Id="DesktopShortcutComponent" />
+    </Feature>
+
+    <ComponentGroup Id="AppFiles" Directory="INSTALLDIR">
+      <Files Include="./release/**">
+        <Exclude Files="./release/XMirror.exe;**/*.pdb;**/XMirror.exe" />
+      </Files>
+    </ComponentGroup>
+
+    <ComponentGroup Id="AppExe" Directory="INSTALLDIR">
+      <Component Id="AppExeComponent"
+                 Guid="e5f23b9b-b726-4738-85ba-63892cff1924">
+        <File Id="AppExeFile"
+              Source="./release/XMirror.exe"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <StandardDirectory Id="DesktopFolder" />
+    <StandardDirectory Id="ProgramMenuFolder" />
+
+    <Component Id="ProgramMenuShortcutComponent"
+               Guid="cd347554-b38e-47f5-801d-152447366101"
+               Directory="ProgramMenuFolder">
+      <RegistryValue
+        Root="HKCU"
+        Key="Software\MadBlast\XMirror"
+        Name="ProgramMenuShortcut"
+        Type="integer"
+        Value="1"
+        KeyPath="yes" />
+      <Shortcut
+        Name="XMirror"
+        Directory="ProgramMenuFolder"
+        Target="[INSTALLDIR]XMirror.exe"
+        WorkingDirectory="INSTALLDIR"
+        Advertise="no" />
+    </Component>
+
+    <Component Id="DesktopShortcutComponent"
+               Guid="63bb69df-4292-4053-848c-fb369bed6273"
+               Directory="DesktopFolder">
+      <RegistryValue
+        Root="HKCU"
+        Key="Software\MadBlast\XMirror"
+        Name="DesktopShortcut"
+        Type="integer"
+        Value="1"
+        KeyPath="yes" />
+      <Shortcut
+        Name="XMirror"
+        Directory="DesktopFolder"
+        Target="[INSTALLDIR]XMirror.exe"
+        WorkingDirectory="INSTALLDIR"
+        Advertise="no" />
+    </Component>
+
+    <!-- ================= uninstall cleanup =================
+         Settings live in HKCU\Software\MadBlast\<app name> (QSettings) and
+         %APPDATA%\MadBlast\<app name>\arguments.txt. Neither is installed by
+         the MSI, so without these rules both survive an uninstall and a
+         reinstall silently inherits stale configuration.
+
+         Caveat worth knowing: this is a perMachine package, so HKCU and
+         %APPDATA% resolve to the *uninstalling* user only. Other users'
+         settings on the same machine are not reachable from here; that is an
+         MSI limitation, not an oversight. -->
+
+    <StandardDirectory Id="AppDataFolder">
+      <Directory Id="AppDataOrgDir" Name="MadBlast">
+        <Directory Id="AppDataAppDir" Name="XMirror" />
+        <!-- Directories left behind by the earlier brand names. The registry
+             equivalents are handled by RemoveRegistryKey below. -->
+        <Directory Id="AppDataLegacyMadMirror" Name="MadMirror" />
+        <Directory Id="AppDataLegacyMadAirPlay" Name="Mad-AirPlay" />
+      </Directory>
+    </StandardDirectory>
+
+    <Component Id="UserDataCleanupComponent"
+               Guid="7c1d4a90-2f6e-4b31-9d84-5a0e3c77b118"
+               Directory="AppDataAppDir">
+      <!-- HKCU keypath: required for a per-user component, and it is itself
+           removed by the RemoveRegistryKey rules below. -->
+      <RegistryValue
+        Root="HKCU"
+        Key="Software\MadBlast\XMirror"
+        Name="Installed"
+        Type="integer"
+        Value="1"
+        KeyPath="yes" />
+
+      <!-- ARPPRODUCTICON alone left DisplayIcon empty in Add/Remove Programs
+           (verified twice, with the Icon Id spelled both .exe and .ico), so
+           write the value directly and point it at the installed executable,
+           whose own embedded icon Windows will then render. Removed with the
+           product because it lives under this component. -->
+      <RegistryValue
+        Root="HKLM"
+        Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode]"
+        Name="DisplayIcon"
+        Type="string"
+        Value="[INSTALLDIR]XMirror.exe" />
+
+      <!-- arguments.txt plus the .legacy/.bak siblings the app may leave. -->
+      <RemoveFile Id="RemoveUserArguments" Name="*" On="uninstall" />
+      <RemoveFolder Id="RemoveUserAppDir" On="uninstall" />
+      <RemoveFolder Id="RemoveUserOrgDir"
+                    Directory="AppDataOrgDir"
+                    On="uninstall" />
+
+      <!-- Current and every previously shipped application name. -->
+      <RemoveRegistryKey Root="HKCU"
+                         Key="Software\MadBlast\XMirror"
+                         Action="removeOnUninstall" />
+      <RemoveRegistryKey Root="HKCU"
+                         Key="Software\MadBlast\MadMirror"
+                         Action="removeOnUninstall" />
+      <RemoveRegistryKey Root="HKCU"
+                         Key="Software\MadBlast\Mad-AirPlay"
+                         Action="removeOnUninstall" />
+    </Component>
+
+    <!-- Directories from the earlier brand names. Separate components because a
+         RemoveFile/RemoveFolder pair can only target the component's own
+         directory. AppDataOrgDir itself is removed by UserDataCleanupComponent,
+         which succeeds only once these have emptied it. -->
+    <Component Id="LegacyMadMirrorCleanupComponent"
+               Guid="b4e8f2a1-6c39-4d57-8e02-1f7a9c4d3e65"
+               Directory="AppDataLegacyMadMirror">
+      <RegistryValue Root="HKCU" Key="Software\MadBlast\XMirror"
+                     Name="LegacyMadMirrorCleanup" Type="integer" Value="1"
+                     KeyPath="yes" />
+      <RemoveFile Id="RemoveLegacyMadMirrorFiles" Name="*" On="uninstall" />
+      <RemoveFolder Id="RemoveLegacyMadMirrorDir" On="uninstall" />
+    </Component>
+
+    <Component Id="LegacyMadAirPlayCleanupComponent"
+               Guid="c9a71d34-58b2-4e60-9f18-2d6b0e5a7c43"
+               Directory="AppDataLegacyMadAirPlay">
+      <RegistryValue Root="HKCU" Key="Software\MadBlast\XMirror"
+                     Name="LegacyMadAirPlayCleanup" Type="integer" Value="1"
+                     KeyPath="yes" />
+      <RemoveFile Id="RemoveLegacyMadAirPlayFiles" Name="*" On="uninstall" />
+      <RemoveFolder Id="RemoveLegacyMadAirPlayDir" On="uninstall" />
+    </Component>
+
+    <!-- Unregister the bundled Bonjour service so no auto-start service is left
+         pointing at a deleted INSTALLDIR. Runs as SYSTEM (deferred, not
+         impersonated) because service removal needs elevation. Return="ignore"
+         so a missing or already-removed service cannot fail the uninstall. -->
+    <CustomAction Id="UnregisterBonjourService"
+                  Directory="INSTALLDIR"
+                  ExeCommand="&quot;[INSTALLDIR]mDNSResponder.exe&quot; -remove"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!-- Register Bonjour during installation rather than leaving it to the
+         app's first run. AirPlay discovery cannot work without mDNS, so it is a
+         hard dependency, and the installer is already elevated: doing it here
+         spares every user a separate UAC prompt on first launch. Return=ignore
+         because a machine that already has Bonjour (iTunes ships it) is a
+         success case, not a failure. -->
+    <CustomAction Id="RegisterBonjourService"
+                  Directory="INSTALLDIR"
+                  ExeCommand="&quot;[INSTALLDIR]mDNSResponder.exe&quot; -install"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="UnregisterBonjourService"
+              Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot;" />
+      <!-- After InstallFiles so mDNSResponder.exe is on disk to be run. -->
+      <Custom Action="RegisterBonjourService"
+              After="InstallFiles"
+              Condition="NOT Installed" />
+    </InstallExecuteSequence>
+
+  </Package>
+</Wix>

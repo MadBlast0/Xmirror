@@ -1,0 +1,14 @@
+build/*
+out/
+.wix/
+release/
+.idea/
+Bonjour SDK/
+dnssd.dll
+__pycache__/
+
+# local safety copies and test reports
+*.bak
+.backup-phase0/
+soak-report.txt
+apply-report.txt

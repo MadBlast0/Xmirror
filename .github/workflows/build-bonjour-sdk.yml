@@ -1,0 +1,40 @@
+name: build Bonjour SDK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build Bonjour SDK ${{ matrix.architecture }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x64
+            runner: windows-2022
+          - architecture: arm64
+            runner: windows-11-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: check out repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: build Bonjour SDK
+        shell: powershell
+        run: .\scripts\build-bonjour.ps1 -Architecture ${{ matrix.architecture }} -Force
+
+      - name: create archive
+        shell: powershell
+        run: Compress-Archive -Path "Bonjour SDK" -DestinationPath "Bonjour-SDK-${{ matrix.architecture }}.zip" -Force
+
+      - name: upload Bonjour SDK
+        uses: actions/upload-artifact@v5
+        with:
+          name: Bonjour-SDK-${{ matrix.architecture }}
+          path: Bonjour-SDK-${{ matrix.architecture }}.zip
+          if-no-files-found: error

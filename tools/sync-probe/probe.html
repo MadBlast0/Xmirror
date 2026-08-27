@@ -1,0 +1,135 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>XMirror Sync Probe</title>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#000;
+            -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+  #stage{position:fixed;inset:0;background:#000}
+  /* Permanent magenta frame: the PC locates the mirrored page by this colour.
+     Nothing in iOS chrome or letterbox bars is magenta, so the bounding box
+     of magenta pixels is exactly the page viewport. */
+  #frame{position:absolute;inset:0;border:2.0vmin solid #f0f;box-sizing:border-box}
+  #band{position:absolute;left:4%;right:4%;top:4.5%;height:11%;display:flex;gap:0}
+  #band div{flex:1 1 0;height:100%}
+  #flash{position:absolute;left:8%;right:8%;top:22%;bottom:8%;background:#000}
+  #hud{position:absolute;left:0;right:0;bottom:1.5vmin;text-align:center;
+       font:600 3.2vmin/1.4 -apple-system,system-ui,sans-serif;color:#0f0;
+       text-shadow:0 0 2px #000;pointer-events:none}
+  #start{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+         background:#111;color:#fff;font:600 6vmin/1.3 -apple-system,system-ui,sans-serif;
+         text-align:center;z-index:10}
+</style>
+
+<div id="stage">
+  <div id="frame"></div>
+  <div id="band"></div>
+  <div id="flash"></div>
+  <div id="hud">starting…</div>
+</div>
+<div id="start">Tap to start<br><span style="font-size:3.2vmin;opacity:.7">
+  then mirror this iPad to XMirror</span></div>
+
+<script>
+"use strict";
+
+// ---- layout ---------------------------------------------------------------
+// 20 patches: [cal-hi, cal-lo, 16 data bits (MSB first), cal-hi, cal-lo].
+// The calibration patches give the PC a per-frame black/white reference so it
+// can threshold without guessing at the display's gamma or the encoder's
+// colour handling.
+const NPATCH = 20, NBITS = 16, WRAP = 1 << NBITS;   // timestamp wraps every 65.536 s
+const band = document.getElementById("band");
+const cells = [];
+for (let i = 0; i < NPATCH; i++) {
+  const d = document.createElement("div");
+  band.appendChild(d);
+  cells.push(d);
+}
+const paint = (i, on) => { cells[i].style.background = on ? "#fff" : "#000"; };
+
+// ---- clock sync (NTP-style, keep the lowest-RTT sample) --------------------
+let offset = 0, bestRtt = Infinity, synced = false;
+
+async function syncOnce() {
+  const t0 = Date.now();
+  const r = await fetch("/t?x=" + Math.random(), { cache: "no-store" });
+  const t2 = Date.now();
+  const t1 = (await r.json()).t;
+  const rtt = t2 - t0;
+  if (rtt < bestRtt) {                 // min-RTT sample has the least asymmetry
+    bestRtt = rtt;
+    offset = t1 - (t0 + t2) / 2;
+    synced = true;
+  }
+}
+
+async function syncLoop() {
+  for (let i = 0; i < 12; i++) { try { await syncOnce(); } catch (e) {} await sleep(120); }
+  setInterval(() => { syncOnce().catch(() => {}); }, 5000);   // track drift
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const serverNow = () => Date.now() + offset;   // PC epoch milliseconds
+
+// ---- video marker: redraw the timestamp every displayed frame --------------
+function tick() {
+  const v = Math.round(serverNow()) % WRAP;
+  paint(0, true); paint(1, false);
+  for (let b = 0; b < NBITS; b++) paint(2 + b, (v >> (NBITS - 1 - b)) & 1);
+  paint(18, true); paint(19, false);
+  requestAnimationFrame(tick);
+}
+
+// ---- audio marker: beep on the server-clock 2 s grid -----------------------
+// Emitting on a grid the PC also knows means the beep needs to carry no
+// payload: the PC maps a detected onset back to the grid point below it.
+const GRID = 2000, TONE = 1000, DUR = 0.040;
+let ctx = null, flashEl = document.getElementById("flash"), beeps = 0;
+
+function scheduleNext() {
+  const now = serverNow();
+  const target = Math.ceil((now + 250) / GRID) * GRID;      // next grid point
+  const lead = (target - now) / 1000;
+  const at = ctx.currentTime + lead;
+
+  const osc = ctx.createOscillator(), g = ctx.createGain();
+  osc.type = "sine"; osc.frequency.value = TONE;
+  // Fast attack keeps the onset edge sharp for detection; short decay avoids a
+  // click that would smear the edge.
+  g.gain.setValueAtTime(0.0001, at);
+  g.gain.exponentialRampToValueAtTime(0.6, at + 0.002);
+  g.gain.setValueAtTime(0.6, at + DUR - 0.006);
+  g.gain.exponentialRampToValueAtTime(0.0001, at + DUR);
+  osc.connect(g).connect(ctx.destination);
+  osc.start(at); osc.stop(at + DUR + 0.02);
+
+  setTimeout(() => {                                        // visual companion
+    flashEl.style.background = "#fff";
+    setTimeout(() => { flashEl.style.background = "#000"; }, 120);
+    beeps++;
+  }, Math.max(0, target - serverNow()));
+
+  setTimeout(scheduleNext, Math.max(50, target - serverNow() + GRID * 0.5));
+}
+
+document.getElementById("start").addEventListener("click", async () => {
+  ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+  await ctx.resume();
+  document.getElementById("start").style.display = "none";
+}, { once: true });
+
+// kick off rendering immediately; audio waits for the tap (iOS requires it)
+requestAnimationFrame(tick);
+syncLoop();
+setInterval(() => {
+  document.getElementById("hud").textContent = synced
+    ? `sync ±${(bestRtt / 2).toFixed(0)}ms · beeps ${beeps}` + (ctx ? "" : " · TAP TO START AUDIO")
+    : "syncing…";
+}, 250);
+(function waitForCtx() {
+  if (ctx) { scheduleNext(); return; }
+  setTimeout(waitForCtx, 100);
+})();
+</script>
