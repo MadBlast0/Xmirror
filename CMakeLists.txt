@@ -14,6 +14,8 @@ add_subdirectory(libxmirror)
 add_executable(XMirror WIN32
     src/main.cpp
     src/mainwindow.cpp
+    src/fluenttheme.cpp
+    src/fluentswitch.cpp
     src/airplayworker.cpp
     src/mdns_responder.cpp
     src/resources.rc
@@ -24,6 +26,7 @@ target_link_libraries(XMirror PRIVATE
     Qt6::Widgets
     xmirror
     psapi          # GetProcessMemoryInfo, for the --soak-test harness
+    dwmapi         # Acrylic backdrop, in fluenttheme.cpp
 )
 
 target_include_directories(XMirror PRIVATE

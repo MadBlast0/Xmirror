@@ -9,6 +9,12 @@ AirPlay engine as a static library.
 src/main.cpp          Qt entry point, single-instance guard, tray bootstrap
 src/mainwindow.cpp    608 lines. Tray menu, autostart, arguments.txt loading,
                       mDNS beacon supervision. The bulk of the GUI.
+src/fluenttheme.*     "Fluent Quiet" look: Fusion + palette + one tokenised
+                      stylesheet, follows Windows light/dark and accent.
+                      enableAcrylic() adds the Acrylic backdrop on Win11 22H2+
+                      and falls back to solid surfaces elsewhere.
+src/fluentswitch.*    Windows 11 toggle (painted QAbstractButton). Colours
+                      come from the stylesheet via qproperty-.
 src/airplayworker.cpp QThread that calls start_xmirror(argc, argv) from
                       libxmirror and loops until interruption.
 src/mdns_responder.*  mDNSResponder beacon subprocess wrapper

@@ -1,6 +1,8 @@
 #include "mainwindow.h"
 #include "airplayworker.h"
 #include "mdns_responder.hpp"
+#include "fluentswitch.h"
+#include "fluenttheme.h"
 #include <windows.h>
 #include <winsvc.h>
 
@@ -39,6 +41,8 @@
 #include <QSpinBox>
 #include <QScrollArea>
 #include <QStackedWidget>
+#include <QFontDatabase>
+#include <QGridLayout>
 
 // Low-latency defaults, verified by measurement (docs/LATENCY-INVESTIGATION.md).
 //
@@ -178,6 +182,10 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     setupTray();
     setupUI();
 
+    // Must precede the native window's creation; falls back to the solid look
+    // on Windows 10 and early Windows 11.
+    FluentTheme::enableAcrylic(this);
+
     applyMachinePolicyLocks();
 
     // Declining the Bonjour install no longer exits. The app stays in the tray
@@ -288,28 +296,70 @@ QStringList MainWindow::getArgumentsFromFile() {
 }
 
 
-// A single settings row: name (and optional one-line explanation) on the left,
-// its control right-aligned. Keeps rows visually consistent regardless of what
-// kind of control they hold.
+// When a change takes effect. Shown as a badge on the row, so the cost of a
+// setting is visible before it is touched rather than discovered afterwards.
+// Mirrors the three tiers in docs/SETTINGS-WINDOW-PLAN.md section 5.
+enum class Tier {
+    Restart,  // tier 3: every argv flag; stops and restarts the worker
+    Instant,  // tier 1: an app preference, applied on the spot
+    Next,     // tier 2: applied to the mirror window at the next connect
+    None,     // an action, not a setting
+};
+
+static QLabel *makeBadge(Tier tier) {
+    QString text;
+    QString value;
+    switch (tier) {
+        case Tier::Restart: text = "Restarts engine"; value = "restart"; break;
+        case Tier::Instant: text = "Instant";         value = "instant"; break;
+        case Tier::Next:    text = "Next session";    value = "next";    break;
+        case Tier::None:    return nullptr;
+    }
+
+    auto *badge = new QLabel(text);
+    badge->setObjectName("badge");
+    // Read by the stylesheet's QLabel#badge[tier="..."] rules.
+    badge->setProperty("tier", value);
+    badge->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    return badge;
+}
+
+// A single settings row: name, tier badge and one-line explanation on the left,
+// the control right-aligned. Rendered as a card by the stylesheet, so rows no
+// longer need separators between them.
 static QWidget *makeRow(const QString &name,
                         const QString &description,
-                        QWidget *control) {
-    auto *row = new QWidget();
+                        QWidget *control,
+                        Tier tier = Tier::Restart) {
+    auto *row = new QFrame();
+    row->setObjectName("row");
+
     auto *layout = new QHBoxLayout(row);
-    layout->setContentsMargins(0, 9, 0, 9);
+    layout->setContentsMargins(16, 11, 16, 11);
     layout->setSpacing(18);
 
     auto *textColumn = new QVBoxLayout();
-    textColumn->setSpacing(2);
+    textColumn->setSpacing(3);
+
+    auto *nameLine = new QHBoxLayout();
+    nameLine->setContentsMargins(0, 0, 0, 0);
+    nameLine->setSpacing(8);
 
     auto *nameLabel = new QLabel(name);
+    nameLabel->setObjectName("rowName");
     nameLabel->setWordWrap(true);
-    textColumn->addWidget(nameLabel);
+    nameLine->addWidget(nameLabel, 0, Qt::AlignVCenter);
+
+    if (QLabel *badge = makeBadge(tier)) {
+        nameLine->addWidget(badge, 0, Qt::AlignVCenter);
+    }
+    nameLine->addStretch(1);
+    textColumn->addLayout(nameLine);
 
     if (!description.isEmpty()) {
         auto *desc = new QLabel(description);
+        desc->setObjectName("rowDesc");
         desc->setWordWrap(true);
-        desc->setEnabled(false);  // renders muted in every Qt style
         textColumn->addWidget(desc);
     }
 
@@ -322,40 +372,30 @@ static QWidget *makeRow(const QString &name,
 }
 
 static QFrame *makeSeparator(Qt::Orientation orientation = Qt::Horizontal) {
+    // Painted by the stylesheet rather than by QFrame's own line drawing, which
+    // takes its colour from the palette and ignores the theme.
     auto *line = new QFrame();
+    line->setObjectName("sep");
+    line->setFrameShape(QFrame::NoFrame);
     if (orientation == Qt::Horizontal) {
-        line->setFrameShape(QFrame::HLine);
         line->setFixedHeight(1);
     } else {
-        line->setFrameShape(QFrame::VLine);
         line->setFixedWidth(1);
     }
-    line->setFrameShadow(QFrame::Plain);
     return line;
 }
 
-// Builds a scrollable page from a heading and an ordered list of rows.
-static QWidget *makePage(const QString &heading, const QList<QWidget *> &rows) {
-    auto *content = new QWidget();
-    auto *layout = new QVBoxLayout(content);
-    layout->setContentsMargins(22, 18, 22, 18);
-    layout->setSpacing(0);
+static QLabel *makeGroupLabel(const QString &text) {
+    auto *label = new QLabel(text.toUpper());
+    label->setObjectName("groupLabel");
+    // Letter spacing is not expressible in Qt's stylesheet subset.
+    QFont f = label->font();
+    f.setLetterSpacing(QFont::AbsoluteSpacing, 0.6);
+    label->setFont(f);
+    return label;
+}
 
-    auto *title = new QLabel(heading);
-    QFont titleFont = title->font();
-    titleFont.setPointSizeF(titleFont.pointSizeF() + 3.0);
-    titleFont.setBold(true);
-    title->setFont(titleFont);
-    layout->addWidget(title);
-    layout->addSpacing(12);
-
-    for (int i = 0; i < rows.size(); ++i) {
-        if (i > 0) layout->addWidget(makeSeparator());
-        layout->addWidget(rows.at(i));
-    }
-
-    layout->addStretch();
-
+static QWidget *makeScrollPage(QWidget *content) {
     auto *scroll = new QScrollArea();
     scroll->setWidget(content);
     scroll->setWidgetResizable(true);
@@ -363,16 +403,74 @@ static QWidget *makePage(const QString &heading, const QList<QWidget *> &rows) {
     return scroll;
 }
 
+// A dynamic property only changes the rendering after a repolish.
+static void repolish(QWidget *widget) {
+    widget->style()->unpolish(widget);
+    widget->style()->polish(widget);
+}
+
+// A labelled cluster of related rows. The label is optional; short pages use a
+// single unlabelled group.
+struct SettingsGroup {
+    QString label;
+    QList<QWidget *> rows;
+};
+
+// Builds a scrollable page from a heading, a one-line introduction and an
+// ordered list of groups.
+static QWidget *makePage(const QString &heading,
+                         const QString &lede,
+                         const QList<SettingsGroup> &groups) {
+    auto *content = new QFrame();
+    content->setObjectName("pageContent");
+
+    auto *layout = new QVBoxLayout(content);
+    layout->setContentsMargins(26, 22, 26, 26);
+    layout->setSpacing(0);
+
+    auto *title = new QLabel(heading);
+    title->setObjectName("pageTitle");
+    layout->addWidget(title);
+
+    if (!lede.isEmpty()) {
+        auto *sub = new QLabel(lede);
+        sub->setObjectName("pageLede");
+        sub->setWordWrap(true);
+        layout->addSpacing(2);
+        layout->addWidget(sub);
+    }
+    layout->addSpacing(16);
+
+    for (int g = 0; g < groups.size(); ++g) {
+        const SettingsGroup &group = groups.at(g);
+        if (g > 0) layout->addSpacing(14);
+
+        if (!group.label.isEmpty()) {
+            layout->addWidget(makeGroupLabel(group.label));
+            layout->addSpacing(6);
+        }
+
+        for (int i = 0; i < group.rows.size(); ++i) {
+            if (i > 0) layout->addSpacing(3);
+            layout->addWidget(group.rows.at(i));
+        }
+    }
+
+    layout->addStretch();
+    return makeScrollPage(content);
+}
+
 void MainWindow::addSection(const QString &name, QWidget *page) {
     m_sectionList->addItem(name);
     m_sectionStack->addWidget(page);
 }
 
-QCheckBox *MainWindow::settingCheckbox(const QString &key, bool defaultValue) {
-    auto *box = new QCheckBox();
+FluentSwitch *MainWindow::settingCheckbox(const QString &key, bool defaultValue) {
+    auto *box = new FluentSwitch();
+    m_switches.insert(key, box);
     QSettings settings;
     box->setChecked(settings.value(key, defaultValue).toBool());
-    connect(box, &QCheckBox::toggled, this, [this, key](bool on) {
+    connect(box, &QAbstractButton::toggled, this, [this, key](bool on) {
         QSettings s;
         if (s.value(key).isValid() && s.value(key).toBool() == on) return;
         s.setValue(key, on);
@@ -385,6 +483,7 @@ QComboBox *MainWindow::settingCombo(const QString &key,
                                     const QVector<QPair<QString, QString>> &options,
                                     const QString &defaultValue) {
     auto *combo = new QComboBox();
+    m_combos.insert(key, combo);
     combo->setMinimumWidth(170);
     for (const auto &option : options) {
         combo->addItem(option.first, option.second);
@@ -433,6 +532,7 @@ QSpinBox *MainWindow::settingSpinBox(const QString &key, int lo, int hi, int ste
                                      int defaultValue, const QString &suffix,
                                      const QString &specialText) {
     auto *spin = new QSpinBox();
+    m_spins.insert(key, spin);
     spin->setRange(lo, hi);
     spin->setSingleStep(step);
     spin->setMinimumWidth(140);
@@ -470,6 +570,7 @@ QComboBox *MainWindow::settingResolutionCombo() {
     combo->setEditable(true);
     combo->setInsertPolicy(QComboBox::NoInsert);
     combo->setMinimumWidth(190);
+    m_resolutionCombo = combo;
 
     // Presets are plain text, so a typed value and a chosen one are the same
     // kind of thing. 3:2 entries matter for iPads, whose panels are not 16:9 --
@@ -532,7 +633,10 @@ QComboBox *MainWindow::settingResolutionCombo() {
 }
 
 QWidget *MainWindow::buildConnectionPage() {
-    return makePage("Connection", {
+    return makePage("Connection",
+                    "How devices find this PC, and who is allowed to mirror to it.",
+    {
+      {"Identity", {
         makeRow("Device name",
                 "Shown in the AirPlay picker. Leave empty to keep the name from "
                 "arguments.txt.",
@@ -540,6 +644,8 @@ QWidget *MainWindow::buildConnectionPage() {
         makeRow("Hide computer name",
                 "Drops the \"@hostname\" suffix clients see.",
                 settingCheckbox("hide_hostname", true)),
+      }},
+      {"Access", {
         makeRow("Ask for a PIN",
                 "A four-digit code must be entered on the device before "
                 "mirroring starts.",
@@ -553,18 +659,23 @@ QWidget *MainWindow::buildConnectionPage() {
         makeRow("Let a new device take over",
                 "Off keeps the first device connected.",
                 settingCheckbox("nohold", false)),
+      }},
     });
 }
 
 QWidget *MainWindow::buildAudioPage() {
-    return makePage("Audio", {
+    return makePage("Audio",
+                    "Sound routed from the device, and how tightly it stays "
+                    "clock-locked.",
+    {
+      {"", {
         makeRow("Audio timing",
                 "Stable keeps audio clock-locked and clean. Responsive plays it "
                 "sooner but it can drift out over a long session.",
                 settingCombo("audio_mode", {
                     {"Stable", "stable"},
                     {"Responsive", "responsive"},
-                }, "stable")),
+                }, effectiveAudioMode())),
         makeRow("Starting volume",
                 "Level used when a device first connects.",
                 settingSpinBox("volume_pct", -1, 100, 5, -1, " %", "Automatic")),
@@ -574,16 +685,17 @@ QWidget *MainWindow::buildAudioPage() {
         makeRow("Picture only, no sound",
                 "Mirrors the screen with audio left on the device.",
                 settingCheckbox("no_audio", false)),
+      }},
     });
 }
 
 QWidget *MainWindow::buildVideoPage() {
     QSettings settings;
 
-    m_fullscreenCheckbox = new QCheckBox();
+    m_fullscreenCheckbox = new FluentSwitch();
     m_fullscreenCheckbox->setChecked(
         settings.value("force_fs_enabled", false).toBool());
-    connect(m_fullscreenCheckbox, &QCheckBox::toggled,
+    connect(m_fullscreenCheckbox, &QAbstractButton::toggled,
             this, &MainWindow::toggleForceFullscreen);
 
     m_rendererCombo = new QComboBox();
@@ -599,7 +711,11 @@ QWidget *MainWindow::buildVideoPage() {
     connect(m_rendererCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onRendererChanged);
 
-    return makePage("Video", {
+    return makePage("Video",
+                    "The picture. These defaults are latency-tuned -- see "
+                    "docs/LOW-LATENCY-SETUP.md before changing them.",
+    {
+      {"Pipeline", {
         makeRow("Renderer",
                 "Automatic keeps the tuned setting from arguments.txt.",
                 m_rendererCombo),
@@ -607,6 +723,8 @@ QWidget *MainWindow::buildVideoPage() {
                 "Same picture at about half the bitrate, decoded on the GPU. "
                 "Devices that do not support it keep using H.264.",
                 settingCheckbox("hevc_enabled", false)),
+      }},
+      {"Presentation", {
         makeRow("Open fullscreen",
                 "Requires a renderer other than Automatic.",
                 m_fullscreenCheckbox),
@@ -628,37 +746,43 @@ QWidget *MainWindow::buildVideoPage() {
         makeRow("Keep window open after disconnect",
                 "Leaves the mirror window on screen when the device stops.",
                 settingCheckbox("keep_window", false)),
+      }},
     });
 }
 
 QWidget *MainWindow::buildBehaviourPage() {
     QSettings settings;
 
-    m_bleCheckbox = new QCheckBox();
+    m_bleCheckbox = new FluentSwitch();
     m_bleCheckbox->setChecked(settings.value("ble_enabled", true).toBool());
-    connect(m_bleCheckbox, &QCheckBox::toggled, this, &MainWindow::toggleBle);
+    connect(m_bleCheckbox, &QAbstractButton::toggled, this, &MainWindow::toggleBle);
 
-    m_autostartCheckbox = new QCheckBox();
+    m_autostartCheckbox = new FluentSwitch();
     m_autostartCheckbox->setChecked(isAutostartEnabled());
-    connect(m_autostartCheckbox, &QCheckBox::toggled,
+    connect(m_autostartCheckbox, &QAbstractButton::toggled,
             this, &MainWindow::toggleAutostart);
 
     // Tier 1: purely an application preference, applied instantly, no engine
     // restart, so it does not go through settingCheckbox().
-    m_openAtLaunchCheckbox = new QCheckBox();
+    m_openAtLaunchCheckbox = new FluentSwitch();
     m_openAtLaunchCheckbox->setChecked(settings.value("open_at_launch", false).toBool());
-    connect(m_openAtLaunchCheckbox, &QCheckBox::toggled, this, [](bool on) {
+    connect(m_openAtLaunchCheckbox, &QAbstractButton::toggled, this, [](bool on) {
         QSettings s;
         s.setValue("open_at_launch", on);
     });
 
-    return makePage("Behaviour", {
+    return makePage("Behaviour",
+                    "What XMirror does when you are not looking at it.",
+    {
+      {"Startup", {
         makeRow("Start at login",
                 "XMirror runs in the tray when you sign in to Windows.",
-                m_autostartCheckbox),
+                m_autostartCheckbox, Tier::Instant),
         makeRow("Open this window at launch",
                 "Off means XMirror starts silently in the tray.",
-                m_openAtLaunchCheckbox),
+                m_openAtLaunchCheckbox, Tier::Instant),
+      }},
+      {"Session", {
         makeRow("Bluetooth discovery",
                 "Helps nearby devices find this PC faster.",
                 m_bleCheckbox),
@@ -678,14 +802,16 @@ QWidget *MainWindow::buildBehaviourPage() {
                 "Reports the frame rate sent by the device. Useful when chasing "
                 "stutter.",
                 settingCheckbox("fps_data", false)),
+      }},
     });
 }
 
-QCheckBox *MainWindow::appCheckbox(const QString &key, bool defaultValue) {
-    auto *box = new QCheckBox();
+FluentSwitch *MainWindow::appCheckbox(const QString &key, bool defaultValue) {
+    auto *box = new FluentSwitch();
+    m_switches.insert(key, box);
     QSettings settings;
     box->setChecked(settings.value(key, defaultValue).toBool());
-    connect(box, &QCheckBox::toggled, this, [key](bool on) {
+    connect(box, &QAbstractButton::toggled, this, [key](bool on) {
         QSettings s;
         s.setValue(key, on);
     });
@@ -729,16 +855,21 @@ QWidget *MainWindow::buildWindowPage() {
                          QString::number(i)});
     }
 
-    return makePage("Window", {
+    return makePage("Window",
+                    "Where the mirrored screen appears. Applied over Win32, so "
+                    "nothing restarts.",
+    {
+      {"", {
         makeRow("Remember position and size",
                 "Reopens the mirrored screen where you last left it.",
-                appCheckbox("remember_geometry", false)),
+                appCheckbox("remember_geometry", false), Tier::Next),
         makeRow("Open on",
                 "Which display the mirrored screen appears on.",
-                appCombo("target_monitor", monitors, QString())),
+                appCombo("target_monitor", monitors, QString()), Tier::Next),
         makeRow("Always on top",
                 "Keeps the mirrored screen above other windows.",
-                appCheckbox("always_on_top", false)),
+                appCheckbox("always_on_top", false), Tier::Next),
+      }},
     });
 }
 
@@ -834,29 +965,413 @@ QWidget *MainWindow::buildAdvancedPage() {
     auto *resetBtn = new QPushButton("Reset to defaults");
     connect(resetBtn, &QPushButton::clicked, this, &MainWindow::resetSettingsToDefaults);
 
-    return makePage("Advanced", {
+    return makePage("Advanced",
+                    "The shipped defaults are tuned. Changing them can cost "
+                    "latency or leave a black window.",
+    {
+      {"", {
         makeRow("Streaming arguments",
                 "The tuned defaults live here. Changing them can cost latency or "
                 "leave a black window. Restart the app to apply.",
-                m_settingsBtn),
+                m_settingsBtn, Tier::None),
         makeRow("Available options",
                 "Full list of supported streaming arguments.",
-                m_listargsBtn),
+                m_listargsBtn, Tier::None),
         makeRow("Licence",
                 "XMirror is GPLv3 and bundles third-party components.",
-                m_licenseBtn),
+                m_licenseBtn, Tier::None),
         makeRow("Reset settings",
                 "Returns every setting to its default. arguments.txt is left "
                 "untouched.",
-                resetBtn),
+                resetBtn, Tier::None),
+      }},
     });
+}
+
+// --- Home ------------------------------------------------------------------
+
+const QStringList &MainWindow::fileArguments() {
+    if (!m_fileArgumentsLoaded) {
+        m_fileArguments = getArgumentsFromFile();
+        m_fileArgumentsLoaded = true;
+    }
+    return m_fileArguments;
+}
+
+static QString flagValue(const QStringList &args, const QString &flag) {
+    const int at = args.lastIndexOf(flag);
+    return (at >= 0 && at + 1 < args.size()) ? args.at(at + 1) : QString();
+}
+
+QString MainWindow::effectiveAudioMode() {
+    const QString stored = QSettings().value("audio_mode").toString();
+    if (stored == "stable" || stored == "responsive") return stored;
+    // "-vsync no" is the only unsynced form; absent or numeric means synced.
+    return flagValue(fileArguments(), "-vsync") == "no" ? "responsive" : "stable";
+}
+
+QString MainWindow::effectiveDeviceName() {
+    const QString stored = QSettings().value("device_name").toString().trimmed();
+    if (!stored.isEmpty()) return stored;
+    const QString fromFile = flagValue(fileArguments(), "-n");
+    return fromFile.isEmpty() ? QStringLiteral("XMirror") : fromFile;
+}
+
+namespace {
+
+struct Preset {
+    const char *id;
+    const char *title;
+    const char *description;
+    const char *audioMode;
+    bool hevc;
+    const char *resolution;  // empty = Automatic
+};
+
+// One choice mapped onto the settings that trade latency against quality.
+// Frame rate limit is always Automatic: a cap saves CPU, not latency. Figures
+// are the measured ones from the audio timing notes in this file.
+const Preset kPresets[] = {
+    {"latency", "Lowest latency",
+     "Audio plays as it arrives, about 170 ms. The shipped default.",
+     "responsive", false, ""},
+    {"balanced", "Balanced",
+     "Clock-locked audio, about 350 ms. Lip sync holds for hours.",
+     "stable", false, ""},
+    {"quality", "Best quality",
+     "HEVC and a 2560 x 1440 request. Uses more GPU and network.",
+     "stable", true, "2560x1440@60"},
+};
+
+// Segoe Fluent Icons on Windows 11 and Segoe MDL2 Assets on Windows 10 share
+// these code points.
+QString heroGlyph(const QString &state) {
+    if (state == "error") return QString(QChar(0xE7BA));    // Warning
+    if (state == "stopped") return QString(QChar(0xE71A));  // Stop
+    return QString(QChar(0xE7F4));                          // TVMonitor
+}
+
+}  // namespace
+
+QString MainWindow::currentPresetId() {
+    QSettings settings;
+    const QString audio = effectiveAudioMode();
+    const bool hevc = settings.value("hevc_enabled", false).toBool();
+    const QString resolution = settings.value("resolution", QString()).toString().trimmed();
+    const int fps = settings.value("fps_limit", 0).toInt();
+
+    for (const Preset &preset : kPresets) {
+        if (audio == QLatin1String(preset.audioMode) && hevc == preset.hevc &&
+            resolution == QLatin1String(preset.resolution) && fps <= 0) {
+            return QString::fromLatin1(preset.id);
+        }
+    }
+    return QString();
+}
+
+void MainWindow::applyPreset(const QString &id) {
+    const Preset *preset = nullptr;
+    for (const Preset &candidate : kPresets) {
+        if (id == QLatin1String(candidate.id)) preset = &candidate;
+    }
+    if (!preset || currentPresetId() == id) {
+        updateHome();  // undo the click's own toggle of the card
+        return;
+    }
+
+    const QString audio = QString::fromLatin1(preset->audioMode);
+    const QString resolution = QString::fromLatin1(preset->resolution);
+
+    QSettings settings;
+    settings.setValue("audio_mode", audio);
+    settings.setValue("hevc_enabled", preset->hevc);
+    settings.setValue("resolution", resolution);
+    settings.setValue("fps_limit", 0);
+
+    // Mirror the values on the section pages with their signals blocked. Each
+    // control's own handler would otherwise ask for a separate engine restart.
+    if (QComboBox *combo = m_combos.value("audio_mode")) {
+        QSignalBlocker blocker(combo);
+        combo->setCurrentIndex(combo->findData(audio));
+    }
+    if (FluentSwitch *hevc = m_switches.value("hevc_enabled")) {
+        QSignalBlocker blocker(hevc);
+        hevc->setChecked(preset->hevc);
+    }
+    if (m_resolutionCombo) {
+        QSignalBlocker blocker(m_resolutionCombo);
+        if (!resolution.isEmpty() && m_resolutionCombo->findText(resolution) < 0) {
+            m_resolutionCombo->addItem(resolution);
+        }
+        m_resolutionCombo->setCurrentText(resolution.isEmpty()
+                                              ? QString(kAutomaticResolution)
+                                              : resolution);
+    }
+    if (QSpinBox *fps = m_spins.value("fps_limit")) {
+        QSignalBlocker blocker(fps);
+        fps->setValue(0);
+    }
+
+    markEngineSettingChanged();  // one restart for the whole preset
+}
+
+QWidget *MainWindow::buildHomePage() {
+    auto *content = new QFrame();
+    content->setObjectName("pageContent");
+
+    auto *layout = new QVBoxLayout(content);
+    layout->setContentsMargins(26, 22, 26, 26);
+    layout->setSpacing(0);
+
+    auto *title = new QLabel("Home");
+    title->setObjectName("pageTitle");
+    layout->addWidget(title);
+
+    auto *lede = new QLabel("Whether XMirror is working, and the few things you "
+                            "actually change.");
+    lede->setObjectName("pageLede");
+    lede->setWordWrap(true);
+    layout->addSpacing(2);
+    layout->addWidget(lede);
+    layout->addSpacing(16);
+
+    // --- status ---
+    auto *hero = new QFrame();
+    hero->setObjectName("hero");
+    auto *heroLayout = new QHBoxLayout(hero);
+    heroLayout->setContentsMargins(18, 16, 18, 16);
+    heroLayout->setSpacing(16);
+
+    m_heroIcon = new QLabel();
+    m_heroIcon->setObjectName("heroIcon");
+    m_heroIcon->setAlignment(Qt::AlignCenter);
+    const QStringList families = QFontDatabase::families();
+    QFont iconFont(families.contains("Segoe Fluent Icons")
+                       ? QStringLiteral("Segoe Fluent Icons")
+                       : QStringLiteral("Segoe MDL2 Assets"));
+    iconFont.setPixelSize(22);
+    m_heroIcon->setFont(iconFont);
+    heroLayout->addWidget(m_heroIcon, 0, Qt::AlignVCenter);
+
+    auto *heroText = new QVBoxLayout();
+    heroText->setSpacing(2);
+    m_heroTitle = new QLabel();
+    m_heroTitle->setObjectName("heroTitle");
+    m_heroSub = new QLabel();
+    m_heroSub->setObjectName("heroSub");
+    m_heroSub->setWordWrap(true);
+    heroText->addWidget(m_heroTitle);
+    heroText->addWidget(m_heroSub);
+    heroLayout->addLayout(heroText, 1);
+
+    m_heroAction = new QPushButton();
+    connect(m_heroAction, &QPushButton::clicked, this, [this]() {
+        // Decided at click time, not from the label: the engine state can move
+        // between the last repaint and the click.
+        if (m_bonjourMissing) {
+            installBonjourService();
+        } else if (m_running && isSessionActive()) {
+            restartEngineNow();
+        } else {
+            toggleServerFromTray();
+        }
+    });
+    heroLayout->addWidget(m_heroAction, 0, Qt::AlignVCenter);
+    layout->addWidget(hero);
+
+    // --- quick settings ---
+    // Each tile is a second view of a control on a section page, not a second
+    // setting: flipping the tile drives the original control, so its handler,
+    // tier and machine-policy lock all still apply.
+    layout->addSpacing(18);
+    layout->addWidget(makeGroupLabel("Quick settings"));
+    layout->addSpacing(6);
+
+    struct Quick {
+        const char *name;
+        const char *sub;
+        FluentSwitch *source;
+    };
+    const Quick quick[] = {
+        {"Ask for a PIN", "A code before mirroring starts", m_switches.value("pin_enabled")},
+        {"Open fullscreen", "Fill the display", m_fullscreenCheckbox},
+        {"Always on top", "Above other windows", m_switches.value("always_on_top")},
+        {"Start at login", "Run in the tray", m_autostartCheckbox},
+    };
+
+    auto *grid = new QGridLayout();
+    grid->setHorizontalSpacing(6);
+    grid->setVerticalSpacing(6);
+    int cell = 0;
+    for (const Quick &item : quick) {
+        FluentSwitch *source = item.source;
+        if (!source) continue;
+
+        auto *tile = new QFrame();
+        tile->setObjectName("tile");
+        auto *tileLayout = new QHBoxLayout(tile);
+        tileLayout->setContentsMargins(14, 10, 12, 10);
+        tileLayout->setSpacing(10);
+
+        auto *text = new QVBoxLayout();
+        text->setSpacing(1);
+        auto *name = new QLabel(item.name);
+        name->setObjectName("rowName");
+        auto *sub = new QLabel(item.sub);
+        sub->setObjectName("tileSub");
+        text->addWidget(name);
+        text->addWidget(sub);
+        tileLayout->addLayout(text, 1);
+
+        auto *mirror = new FluentSwitch();
+        mirror->setChecked(source->isChecked());
+        tileLayout->addWidget(mirror, 0, Qt::AlignVCenter);
+
+        connect(mirror, &QAbstractButton::toggled, source,
+                [source](bool on) { source->setChecked(on); });
+        connect(source, &QAbstractButton::toggled, mirror, [mirror](bool on) {
+            QSignalBlocker blocker(mirror);
+            mirror->setChecked(on);
+        });
+        m_homeTiles.append(qMakePair(mirror, source));
+
+        grid->addWidget(tile, cell / 2, cell % 2);
+        ++cell;
+    }
+    layout->addLayout(grid);
+
+    // --- presets ---
+    layout->addSpacing(18);
+    layout->addWidget(makeGroupLabel("Preset"));
+    layout->addSpacing(2);
+    auto *presetLede = new QLabel("Sets audio timing, HEVC, resolution and frame "
+                                  "rate limit together.");
+    presetLede->setObjectName("pageLede");
+    presetLede->setWordWrap(true);
+    layout->addWidget(presetLede);
+    layout->addSpacing(8);
+
+    auto *cards = new QHBoxLayout();
+    cards->setSpacing(6);
+    for (const Preset &preset : kPresets) {
+        auto *card = new QPushButton();
+        card->setObjectName("presetCard");
+        card->setCheckable(true);
+        card->setCursor(Qt::PointingHandCursor);
+        card->setProperty("preset", QString::fromLatin1(preset.id));
+        card->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+        card->setMinimumHeight(96);
+
+        auto *cardLayout = new QVBoxLayout(card);
+        cardLayout->setContentsMargins(13, 11, 13, 12);
+        cardLayout->setSpacing(3);
+        auto *cardTitle = new QLabel(preset.title);
+        cardTitle->setObjectName("presetTitle");
+        auto *cardDesc = new QLabel(preset.description);
+        cardDesc->setObjectName("presetDesc");
+        cardDesc->setWordWrap(true);
+        cardDesc->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+        // Clicks land on the button, not on the labels drawn inside it.
+        cardTitle->setAttribute(Qt::WA_TransparentForMouseEvents);
+        cardDesc->setAttribute(Qt::WA_TransparentForMouseEvents);
+        cardLayout->addWidget(cardTitle);
+        cardLayout->addWidget(cardDesc);
+        cardLayout->addStretch();
+
+        connect(card, &QPushButton::clicked, this,
+                [this, id = QString::fromLatin1(preset.id)]() { applyPreset(id); });
+        m_presetCards.append(card);
+        cards->addWidget(card, 1);
+    }
+    layout->addLayout(cards);
+
+    m_presetNote = new QLabel("Custom: your settings no longer match a preset.");
+    m_presetNote->setObjectName("pageLede");
+    layout->addSpacing(8);
+    layout->addWidget(m_presetNote);
+
+    layout->addStretch();
+
+    updateHome();
+    return makeScrollPage(content);
+}
+
+void MainWindow::updateHome() {
+    if (m_heroIcon && m_heroTitle && m_heroSub && m_heroAction) {
+        QString state;
+        QString title;
+        QString sub;
+        QString action;
+        bool primary = false;
+
+        if (m_bonjourMissing) {
+            state = "error";
+            title = "Discovery unavailable";
+            sub = "Bonjour Service is not installed, so devices cannot find this PC.";
+            action = "Install Bonjour";
+            primary = true;
+        } else if (!m_running) {
+            state = "stopped";
+            title = "AirPlay is stopped";
+            sub = "Devices cannot see this PC until you start it.";
+            action = "Start AirPlay";
+            primary = true;
+        } else if (isSessionActive()) {
+            state = "live";
+            title = "Mirroring";
+            sub = "A device is connected. Disconnecting restarts the receiver, "
+                  "which takes about a second.";
+            action = "Disconnect";
+        } else {
+            state = "ready";
+            title = "Ready";
+            sub = QString("Visible as “%1” to devices on this network.")
+                      .arg(effectiveDeviceName());
+            action = "Stop AirPlay";
+        }
+
+        m_heroTitle->setText(title);
+        m_heroSub->setText(sub);
+        m_heroAction->setText(action);
+        m_heroIcon->setText(heroGlyph(state));
+
+        if (m_heroIcon->property("state").toString() != state) {
+            m_heroIcon->setProperty("state", state);
+            repolish(m_heroIcon);
+        }
+        // Start and Install are the way forward; Stop and Disconnect are not
+        // something to invite with an accent fill.
+        const QString buttonName = primary ? QStringLiteral("primary") : QString();
+        if (m_heroAction->objectName() != buttonName) {
+            m_heroAction->setObjectName(buttonName);
+            repolish(m_heroAction);
+        }
+    }
+
+    // Tiles follow their source, including state changed behind their back:
+    // the autostart registry, a machine-policy lock, a reset.
+    for (const auto &tile : std::as_const(m_homeTiles)) {
+        QSignalBlocker blocker(tile.first);
+        tile.first->setChecked(tile.second->isChecked());
+        tile.first->setEnabled(tile.second->isEnabled());
+        tile.first->setToolTip(tile.second->toolTip());
+    }
+
+    if (!m_presetCards.isEmpty()) {
+        const QString current = currentPresetId();
+        for (QPushButton *card : std::as_const(m_presetCards)) {
+            QSignalBlocker blocker(card);
+            card->setChecked(card->property("preset").toString() == current);
+        }
+        if (m_presetNote) m_presetNote->setVisible(current.isEmpty());
+    }
 }
 
 void MainWindow::setupUI() {
     setWindowTitle("XMirror");
     setWindowIcon(QApplication::windowIcon());
-    resize(720, 500);
-    setMinimumSize(600, 420);
+    resize(760, 560);
+    setMinimumSize(660, 460);
 
     auto *central = new QWidget(this);
     setCentralWidget(central);
@@ -866,7 +1381,10 @@ void MainWindow::setupUI() {
     root->setSpacing(0);
 
     // --- notice bar: persistent, for things that need attention ---
-    m_noticeBar = new QWidget();
+    // A QFrame rather than a bare QWidget: only QFrame paints a stylesheet
+    // background without WA_StyledBackground being set by hand.
+    m_noticeBar = new QFrame();
+    m_noticeBar->setObjectName("noticeBar");
     {
         auto *noticeLayout = new QHBoxLayout(m_noticeBar);
         noticeLayout->setContentsMargins(16, 10, 16, 10);
@@ -886,7 +1404,8 @@ void MainWindow::setupUI() {
     root->addWidget(m_noticeBar);
 
     // --- deferral bar: shown only while changes are queued ---
-    m_deferralBar = new QWidget();
+    m_deferralBar = new QFrame();
+    m_deferralBar->setObjectName("deferralBar");
     {
         auto *barLayout = new QHBoxLayout(m_deferralBar);
         barLayout->setContentsMargins(16, 10, 16, 10);
@@ -901,6 +1420,7 @@ void MainWindow::setupUI() {
         barLayout->addWidget(laterBtn);
 
         auto *nowBtn = new QPushButton("Apply now");
+        nowBtn->setObjectName("primary");
         connect(nowBtn, &QPushButton::clicked, this, &MainWindow::applyPendingNow);
         barLayout->addWidget(nowBtn);
     }
@@ -914,7 +1434,8 @@ void MainWindow::setupUI() {
     bodyLayout->setSpacing(0);
 
     m_sectionList = new QListWidget();
-    m_sectionList->setFixedWidth(160);
+    m_sectionList->setObjectName("rail");
+    m_sectionList->setFixedWidth(200);
     m_sectionList->setFrameShape(QFrame::NoFrame);
     m_sectionList->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
 
@@ -924,14 +1445,22 @@ void MainWindow::setupUI() {
     bodyLayout->addWidget(makeSeparator(Qt::Vertical));
     bodyLayout->addWidget(m_sectionStack, 1);
 
-    // Sections are added only once they have content. Connection, Audio and
-    // Window arrive in later phases.
-    addSection("Connection", buildConnectionPage());
-    addSection("Video", buildVideoPage());
-    addSection("Audio", buildAudioPage());
-    addSection("Behaviour", buildBehaviourPage());
-    addSection("Window", buildWindowPage());
-    addSection("Advanced", buildAdvancedPage());
+    // Home is listed first but built last: its quick switches mirror controls
+    // that the other pages create.
+    QWidget *connectionPage = buildConnectionPage();
+    QWidget *videoPage = buildVideoPage();
+    QWidget *audioPage = buildAudioPage();
+    QWidget *behaviourPage = buildBehaviourPage();
+    QWidget *windowPage = buildWindowPage();
+    QWidget *advancedPage = buildAdvancedPage();
+
+    addSection("Home", buildHomePage());
+    addSection("Connection", connectionPage);
+    addSection("Video", videoPage);
+    addSection("Audio", audioPage);
+    addSection("Behaviour", behaviourPage);
+    addSection("Window", windowPage);
+    addSection("Advanced", advancedPage);
 
     connect(m_sectionList, &QListWidget::currentRowChanged,
             m_sectionStack, &QStackedWidget::setCurrentIndex);
@@ -942,9 +1471,18 @@ void MainWindow::setupUI() {
     // --- footer: engine status ---
     root->addWidget(makeSeparator());
 
-    auto *footer = new QWidget();
+    auto *footer = new QFrame();
+    footer->setObjectName("footer");
     auto *footerLayout = new QHBoxLayout(footer);
-    footerLayout->setContentsMargins(16, 9, 16, 9);
+    footerLayout->setContentsMargins(18, 9, 18, 9);
+    footerLayout->setSpacing(9);
+
+    // Engine state as a colour as well as a sentence, so it is readable at a
+    // glance without reading.
+    m_statusDot = new QLabel();
+    m_statusDot->setObjectName("statusDot");
+    m_statusDot->setProperty("state", "idle");
+    footerLayout->addWidget(m_statusDot, 0, Qt::AlignVCenter);
 
     m_statusLabel = new QLabel("Starting...");
     footerLayout->addWidget(m_statusLabel);
@@ -1171,10 +1709,23 @@ void MainWindow::applyRendererAndFullscreenArgs(QStringList &args) {
     //
     // Note this also flips the VIDEO sink's sync, because audio_renderer.c:180
     // ties them to the same flag.
-    const QString audioMode = settings.value("audio_mode", "stable").toString();
+    //
+    // Only an explicit choice changes anything. Unset means "leave arguments.txt
+    // alone", which for the shipped line is "-vsync no". Previously "stable"
+    // was treated the same as unset, so choosing it did nothing on a default
+    // install while the combo claimed clock-locked audio.
+    const QString audioMode = settings.value("audio_mode").toString();
     if (audioMode == "responsive") {
         stripFlag(args, "-vsync", true);
         args << "-vsync" << "no";
+    } else if (audioMode == "stable") {
+        // Replace only "no". A numeric -vsync is already synced and carries a
+        // deliberate A/V trim that must survive.
+        const int at = args.lastIndexOf("-vsync");
+        if (at >= 0 && at + 1 < args.size() && args.at(at + 1) == "no") {
+            stripFlag(args, "-vsync", true);
+            args << "-vsync" << "0";
+        }
     }
 
     stripFlag(args, "-taper", false);
@@ -1347,8 +1898,23 @@ void MainWindow::removeMirrorWindowHook() {
 }
 
 void MainWindow::notifyMirrorWindowEvent() {
+    // The hook delivers destroy events too. A window that has gone while the
+    // engine keeps running -- a client that drops without the engine ending
+    // its session -- must be released here. The early return below used to
+    // keep the stale handle forever, so the app went on believing a device was
+    // connected: settings stayed deferred and status said "Mirroring".
+    if (m_mirrorHwnd && !IsWindow(reinterpret_cast<HWND>(m_mirrorHwnd))) {
+        qDebug() << "[mirror] adopted window destroyed while the engine runs";
+        forgetMirrorWindow();
+        // Adoption stopped the fallback poll; a later connection still needs it.
+        if (m_running && m_mirrorFallbackTimer) m_mirrorFallbackTimer->start(1000);
+        updateStatus();
+    }
+
     if (m_mirrorHwnd) return;  // already adopted
     tryAdoptMirrorWindow();
+    // Status, tray and Home all key off the session, so tell them it started.
+    if (m_mirrorHwnd) updateStatus();
 }
 
 void MainWindow::tryAdoptMirrorWindow() {
@@ -1529,6 +2095,7 @@ void MainWindow::closeEvent(QCloseEvent *event) {
 // restarted to pick it up. Tier 1 settings (autostart, window preferences) take
 // effect on the spot and never come through here.
 void MainWindow::markEngineSettingChanged() {
+    updateHome();  // a changed setting can leave or match a preset
     ++m_pendingChanges;
 
     // Nothing running: the new value is simply read at the next start.
@@ -1628,7 +2195,7 @@ void MainWindow::resetSettingsToDefaults() {
         "password", "nohold", "force_fs_enabled", "renderer_mode", "resolution",
         "hevc_enabled",
         "fps_limit", "rotation", "keep_window", "audio_latency_ms", "vsync_ms",
-        "vsync_set", "volume_pct", "taper", "no_audio", "screensaver",
+        "vsync_set", "audio_mode", "volume_pct", "taper", "no_audio", "screensaver",
         "reset_secs", "fps_data", "ble_enabled",
         "remember_geometry", "target_monitor", "always_on_top",
         "mirror_x", "mirror_y", "mirror_w", "mirror_h",
@@ -1672,10 +2239,13 @@ void MainWindow::toggleServerFromTray() {
 
 void MainWindow::updateStatus() {
     QString status;
+    const char *dotState = "idle";
     if (m_bonjourMissing) {
         status = "Discovery unavailable - Bonjour not installed";
+        dotState = "error";
     } else if (m_running) {
         status = isSessionActive() ? "Mirroring" : "Waiting for a device";
+        if (isSessionActive()) dotState = "live";
     } else {
         status = "AirPlay stopped";
     }
@@ -1683,6 +2253,12 @@ void MainWindow::updateStatus() {
     // Every one of these can be null: updateStatus() runs during construction
     // and again after the engine stops, and the UI is built in stages.
     if (m_statusLabel) m_statusLabel->setText(status);
+    if (m_statusDot && m_statusDot->property("state").toString() != dotState) {
+        // A dynamic property only changes the rendering after a repolish.
+        m_statusDot->setProperty("state", dotState);
+        m_statusDot->style()->unpolish(m_statusDot);
+        m_statusDot->style()->polish(m_statusDot);
+    }
     if (m_statusAction) m_statusAction->setText(status);
     if (m_tray) m_tray->setToolTip("XMirror - " + status);
 
@@ -1695,6 +2271,8 @@ void MainWindow::updateStatus() {
         QSignalBlocker blocker(m_autostartCheckbox);
         m_autostartCheckbox->setChecked(isAutostartEnabled());
     }
+
+    updateHome();
 }
 
 bool MainWindow::isWindowsServicePresent(const std::wstring& serviceName) const {

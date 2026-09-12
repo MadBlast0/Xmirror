@@ -11,6 +11,9 @@
 #include <QProcess>
 #include <QCheckBox>
 #include <QMessageBox>
+#include <QFrame>
+#include <QHash>
+#include <QVector>
 
 class QMenu;
 class QAction;
@@ -20,6 +23,7 @@ class QStackedWidget;
 class QLineEdit;
 class QSpinBox;
 class AirPlayWorker;
+class FluentSwitch;
 
 // The built-in low-latency argument line. Exposed so the --soak-test harness in
 // main.cpp exercises the engine with exactly the arguments the app ships with.
@@ -151,7 +155,7 @@ private:
     // Tier 1/2 controls: application or window preferences. They apply
     // instantly or at the next connect, and never restart the engine, so they
     // deliberately do not go through settingCheckbox()/settingCombo().
-    QCheckBox *appCheckbox(const QString &key, bool defaultValue);
+    FluentSwitch *appCheckbox(const QString &key, bool defaultValue);
     QComboBox *appCombo(const QString &key,
                         const QVector<QPair<QString, QString>> &options,
                         const QString &defaultValue);
@@ -160,7 +164,7 @@ private:
     // for an engine restart through the tier-3 path. Reading happens from
     // QSettings, never from the widgets, so argument building does not depend
     // on the UI existing.
-    QCheckBox *settingCheckbox(const QString &key, bool defaultValue);
+    FluentSwitch *settingCheckbox(const QString &key, bool defaultValue);
     QComboBox *settingCombo(const QString &key,
                             const QVector<QPair<QString, QString>> &options,
                             const QString &defaultValue);
@@ -180,6 +184,39 @@ private:
     QListWidget *m_sectionList = nullptr;
     QStackedWidget *m_sectionStack = nullptr;
 
+    // --- home page ----------------------------------------------------------
+    // Status, the four switches people actually flip, and presets that set
+    // several engine settings at once. Built after the section pages, because
+    // its quick switches mirror controls those pages own.
+    QWidget *buildHomePage();
+    void updateHome();
+    void applyPreset(const QString &id);
+    QString currentPresetId();  // empty when the settings match no preset
+
+    // What the engine will actually do, not only what is stored: when a
+    // setting has never been chosen, arguments.txt decides.
+    QString effectiveAudioMode();
+    QString effectiveDeviceName();
+    // arguments.txt parsed once; changing it needs an app restart anyway.
+    const QStringList &fileArguments();
+
+    QStringList m_fileArguments;
+    bool m_fileArgumentsLoaded = false;
+
+    // Controls by QSettings key, so presets can reflect what they set.
+    QHash<QString, FluentSwitch *> m_switches;
+    QHash<QString, QComboBox *> m_combos;
+    QHash<QString, QSpinBox *> m_spins;
+    QComboBox *m_resolutionCombo = nullptr;
+
+    QLabel *m_heroIcon = nullptr;
+    QLabel *m_heroTitle = nullptr;
+    QLabel *m_heroSub = nullptr;
+    QPushButton *m_heroAction = nullptr;
+    QVector<QPair<FluentSwitch *, FluentSwitch *>> m_homeTiles;  // (tile, source)
+    QVector<QPushButton *> m_presetCards;
+    QLabel *m_presetNote = nullptr;
+
     // --- apply engine -----------------------------------------------------
     // Settings that map to engine arguments need the engine restarted, because
     // start_xmirror() reads its configuration exactly once. Restarting is cheap
@@ -192,31 +229,32 @@ private:
     // A live session is exactly "the sink has a window open".
     bool isSessionActive() const { return m_mirrorHwnd != nullptr; }
 
-    QWidget *m_noticeBar = nullptr;
+    QFrame *m_noticeBar = nullptr;
     QLabel *m_noticeLabel = nullptr;
     QPushButton *m_noticeAction = nullptr;
     std::function<void()> m_noticeCallback;
     bool m_bonjourMissing = false;
 
-    QWidget *m_deferralBar = nullptr;
+    QFrame *m_deferralBar = nullptr;
     QLabel *m_deferralLabel = nullptr;
     int m_pendingChanges = 0;
     bool m_applyWhenIdle = false;
 
-    QCheckBox *m_bleCheckbox = nullptr;
-    QCheckBox *m_fullscreenCheckbox = nullptr;
+    FluentSwitch *m_bleCheckbox = nullptr;
+    FluentSwitch *m_fullscreenCheckbox = nullptr;
     QComboBox *m_rendererCombo = nullptr;
     QSystemTrayIcon *m_tray = nullptr;
     QMenu *m_trayMenu = nullptr;
     QAction *m_statusAction = nullptr;
     QAction *m_toggleServerAction = nullptr;
 
-    QCheckBox *m_autostartCheckbox = nullptr;
-    QCheckBox *m_openAtLaunchCheckbox = nullptr;
+    FluentSwitch *m_autostartCheckbox = nullptr;
+    FluentSwitch *m_openAtLaunchCheckbox = nullptr;
     QPushButton *m_settingsBtn = nullptr;
     QPushButton *m_listargsBtn = nullptr;
     QPushButton *m_licenseBtn = nullptr;
     QLabel *m_statusLabel = nullptr;
+    QLabel *m_statusDot = nullptr;
 
     AirPlayWorker *m_worker = nullptr;
 

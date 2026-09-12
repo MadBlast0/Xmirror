@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "fluenttheme.h"
 #include <QAbstractNativeEventFilter>
 #include <QApplication>
 #include <QDir>
@@ -390,6 +391,10 @@ int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
     app.setOrganizationName("MadBlast");
     app.setApplicationName("XMirror");
+
+    // Style, palette, font and stylesheet. Installed before anything builds a
+    // widget, and it keeps following the Windows light/dark setting after.
+    FluentTheme::install();
 
     // Both QSettings and the arguments.txt directory are keyed on the
     // application name, so the renames (Mad-AirPlay -> MadMirror -> XMirror)
