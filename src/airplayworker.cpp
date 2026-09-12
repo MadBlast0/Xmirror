@@ -74,7 +74,11 @@ void AirPlayWorker::run() {
         }
 
         if (ret != 0) {
-            emit errorOccurred(QString("Engine exited with code %1").arg(ret));
+            // The engine says why in plain language when it knows.
+            const QString reason = QString::fromUtf8(xmirror_last_error()).trimmed();
+            emit errorOccurred(reason.isEmpty()
+                                   ? QString("The AirPlay engine stopped unexpectedly (code %1).").arg(ret)
+                                   : reason);
             break;
         }
     }

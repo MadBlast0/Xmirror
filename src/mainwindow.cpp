@@ -3,7 +3,12 @@
 #include "mdns_responder.hpp"
 #include "fluentswitch.h"
 #include "fluenttheme.h"
+#include "updatechecker.h"
+#include "xmirror_api.h"
+#include "mirrorshape.h"
 #include <windows.h>
+
+#include <string>
 #include <winsvc.h>
 
 #include <QProcess>
@@ -43,6 +48,7 @@
 #include <QStackedWidget>
 #include <QFontDatabase>
 #include <QGridLayout>
+#include <QProgressBar>
 
 // Low-latency defaults, verified by measurement (docs/LATENCY-INVESTIGATION.md).
 //
@@ -178,13 +184,34 @@ static void CALLBACK MirrorWinEventProc(HWINEVENTHOOK, DWORD, HWND hwnd,
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     g_mainWindow = this;
 
+    // Things the user should know that did not stop the engine, such as a
+    // fallback to software video decoding. Arrives on the engine's thread.
+    xmirror_set_notice_callback([](const char *message) {
+        if (MainWindow *window = g_mainWindow) {
+            const QString text = QString::fromUtf8(message);
+            QMetaObject::invokeMethod(
+                window, [window, text]() { window->showNotice(text); }, Qt::QueuedConnection);
+        }
+    });
+
+    // The engine reports the picture size from its own thread; hop to this one.
+    xmirror_set_video_size_callback([](int width, int height, int, int) {
+        if (MainWindow *window = g_mainWindow) {
+            QMetaObject::invokeMethod(
+                window, [window, width, height]() { window->onVideoSizeChanged(width, height); },
+                Qt::QueuedConnection);
+        }
+    });
+
+    // Before the tray and pages, which both show update state.
+    m_updater = new UpdateChecker(this);
+    connect(m_updater, &UpdateChecker::stateChanged, this, &MainWindow::updateUpdateUi);
+    connect(m_updater, &UpdateChecker::progressChanged, this, &MainWindow::updateUpdateUi);
+
     ensureSettingsFileExists();
     setupTray();
     setupUI();
 
-    // Must precede the native window's creation; falls back to the solid look
-    // on Windows 10 and early Windows 11.
-    FluentTheme::enableAcrylic(this);
 
     applyMachinePolicyLocks();
 
@@ -194,9 +221,29 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         startServer();
     }
     updateStatus();
+
+    // In the background, a few seconds in, so it never competes with the engine
+    // coming up. One small HTTPS request; nothing is downloaded without asking.
+    // Skipped under the --test-apply harness, which must not touch the network.
+    if (!QCoreApplication::arguments().contains("--test-apply")) {
+        if (QSettings().value("check_updates", true).toBool()) {
+            QTimer::singleShot(5000, m_updater, &UpdateChecker::check);
+        }
+        // XMirror usually starts at sign-in and then lives in the tray for days,
+        // so a check at launch alone could miss a release for weeks. The switch
+        // is read each time, so turning it off takes effect without a restart.
+        auto *dailyCheck = new QTimer(this);
+        dailyCheck->setInterval(24 * 60 * 60 * 1000);
+        connect(dailyCheck, &QTimer::timeout, this, [this]() {
+            if (QSettings().value("check_updates", true).toBool()) m_updater->check();
+        });
+        dailyCheck->start();
+    }
 }
 
 MainWindow::~MainWindow() {
+    xmirror_set_video_size_callback(nullptr);
+    xmirror_set_notice_callback(nullptr);
     m_quitting = true;
     removeMirrorWindowHook();
     stopServer();
@@ -347,7 +394,9 @@ static QWidget *makeRow(const QString &name,
 
     auto *nameLabel = new QLabel(name);
     nameLabel->setObjectName("rowName");
-    nameLabel->setWordWrap(true);
+    // Names are short and must stay on one line: wrapping squeezed them to
+    // make room for the badge ("Hide computer" / "name"). The description
+    // below is the part that wraps.
     nameLine->addWidget(nameLabel, 0, Qt::AlignVCenter);
 
     if (QLabel *badge = makeBadge(tier)) {
@@ -729,9 +778,9 @@ QWidget *MainWindow::buildVideoPage() {
                 "Requires a renderer other than Automatic.",
                 m_fullscreenCheckbox),
         makeRow("Resolution",
-                "A request only - the device decides. Type any size, e.g. "
-                "2388x1668@60 for an 11-inch iPad. Matching the device's own "
-                "panel avoids both upscaling and black bars.",
+                "The device fits its picture to this height and sets the width "
+                "from how it is held, so the height decides sharpness in both "
+                "orientations. Type any size, e.g. 1920x1668@60.",
                 settingResolutionCombo()),
         makeRow("Frame rate limit",
                 "Lower uses less CPU and network.",
@@ -771,6 +820,18 @@ QWidget *MainWindow::buildBehaviourPage() {
         s.setValue("open_at_launch", on);
     });
 
+    m_checkNowButton = new QPushButton("Check now");
+    connect(m_checkNowButton, &QPushButton::clicked, this, [this]() {
+        // Asking explicitly overrides an earlier "skip this version".
+        QSettings().remove("update_skipped_version");
+        m_updater->check();
+        updateUpdateUi();
+    });
+    QWidget *versionRow = makeRow(
+        QString("XMirror %1").arg(UpdateChecker::currentVersionString()),
+        "Not checked yet.", m_checkNowButton, Tier::None);
+    m_updateStatus = versionRow->findChild<QLabel *>("rowDesc");
+
     return makePage("Behaviour",
                     "What XMirror does when you are not looking at it.",
     {
@@ -802,6 +863,14 @@ QWidget *MainWindow::buildBehaviourPage() {
                 "Reports the frame rate sent by the device. Useful when chasing "
                 "stutter.",
                 settingCheckbox("fps_data", false)),
+      }},
+      {"Updates", {
+        versionRow,
+        makeRow("Check for updates at launch",
+                "Looks for a new release on GitHub in the background when "
+                "XMirror starts, and daily while it runs. Nothing is downloaded "
+                "without asking.",
+                appCheckbox("check_updates", true), Tier::Instant),
       }},
     });
 }
@@ -839,6 +908,36 @@ QComboBox *MainWindow::appCombo(const QString &key,
     return combo;
 }
 
+// Windows' own rectangles for a Qt screen, in physical pixels. QScreen geometry
+// is in device-independent pixels, which do not line up with GetWindowRect or
+// SetWindowPos on a scaled display. Matched by GDI device name.
+struct PhysicalMonitor {
+    std::wstring deviceName;
+    RECT bounds{};
+    RECT work{};
+    bool found = false;
+};
+
+static BOOL CALLBACK matchMonitorByName(HMONITOR monitor, HDC, LPRECT, LPARAM data) {
+    auto *match = reinterpret_cast<PhysicalMonitor *>(data);
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(monitor, &info) && match->deviceName == info.szDevice) {
+        match->bounds = info.rcMonitor;
+        match->work = info.rcWork;
+        match->found = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static PhysicalMonitor physicalMonitorFor(const QScreen *screen) {
+    PhysicalMonitor match;
+    match.deviceName = screen->name().toStdWString();
+    EnumDisplayMonitors(nullptr, nullptr, matchMonitorByName, reinterpret_cast<LPARAM>(&match));
+    return match;
+}
+
 QWidget *MainWindow::buildWindowPage() {
     // Monitors are listed as they are now. If the chosen one is gone by the
     // time a session starts, applyMirrorWindowPreferences() falls back to the
@@ -848,12 +947,25 @@ QWidget *MainWindow::buildWindowPage() {
     const QList<QScreen *> screens = QGuiApplication::screens();
     for (int i = 0; i < screens.size(); ++i) {
         const QScreen *screen = screens.at(i);
+        // The panel's real resolution, not its scaled size: a 4K screen at 150%
+        // should read 3840 x 2160, not 2560 x 1440.
+        const PhysicalMonitor physical = physicalMonitorFor(screen);
+        const QSize size = physical.found
+            ? QSize(physical.bounds.right - physical.bounds.left,
+                    physical.bounds.bottom - physical.bounds.top)
+            : (QSizeF(screen->geometry().size()) * screen->devicePixelRatio()).toSize();
         monitors.append({QString("Monitor %1 (%2 x %3)")
                              .arg(i + 1)
-                             .arg(screen->geometry().width())
-                             .arg(screen->geometry().height()),
+                             .arg(size.width())
+                             .arg(size.height()),
                          QString::number(i)});
     }
+
+    // Not appCheckbox(): changing it must also re-fit a window that is open now.
+    auto *lockSwitch = new FluentSwitch();
+    lockSwitch->setChecked(mirrorAspectLocked());
+    m_switches.insert("mirror_lock_aspect", lockSwitch);
+    connect(lockSwitch, &QAbstractButton::toggled, this, &MainWindow::setMirrorAspectLock);
 
     return makePage("Window",
                     "Where the mirrored screen appears. Applied over Win32, so "
@@ -869,6 +981,11 @@ QWidget *MainWindow::buildWindowPage() {
         makeRow("Always on top",
                 "Keeps the mirrored screen above other windows.",
                 appCheckbox("always_on_top", false), Tier::Next),
+        makeRow("Lock aspect ratio",
+                "Sizes the mirrored screen to the device's picture, including when "
+                "it rotates, so there are no black bars. Off lets the window resize "
+                "freely. Also in the mirror window's title-bar menu.",
+                lockSwitch, Tier::Instant),
       }},
     });
 }
@@ -895,15 +1012,11 @@ void MainWindow::applyMirrorWindowPreferences() {
         const int h = settings.value("mirror_h", 0).toInt();
 
         if (x != INT_MIN && y != INT_MIN && w > 0 && h > 0) {
-            // Only honour it if it still lands on a screen that exists.
-            bool onScreen = false;
-            const QList<QScreen *> screens = QGuiApplication::screens();
-            for (const QScreen *screen : screens) {
-                if (screen->geometry().intersects(QRect(x, y, w, h))) {
-                    onScreen = true;
-                    break;
-                }
-            }
+            // Only honour it if it still lands on a screen that exists. Asked of
+            // Windows directly: the rectangle was saved from GetWindowRect, in
+            // physical pixels, which Qt's scaled screen geometry does not match.
+            const RECT saved{x, y, x + w, y + h};
+            const bool onScreen = MonitorFromRect(&saved, MONITOR_DEFAULTTONULL) != nullptr;
             if (onScreen) {
                 SetWindowPos(hwnd, nullptr, x, y, w, h,
                              SWP_NOZORDER | SWP_NOACTIVATE);
@@ -920,9 +1033,13 @@ void MainWindow::applyMirrorWindowPreferences() {
         bool ok = false;
         const int index = monitorIndex.toInt(&ok);
         const QList<QScreen *> screens = QGuiApplication::screens();
-        if (ok && index >= 0 && index < screens.size()) {
-            const QRect area = screens.at(index)->availableGeometry();
-            SetWindowPos(hwnd, nullptr, area.x() + 40, area.y() + 40, 0, 0,
+        const PhysicalMonitor target =
+            (ok && index >= 0 && index < screens.size()) ? physicalMonitorFor(screens.at(index))
+                                                         : PhysicalMonitor{};
+        if (target.found) {
+            // Synchronous on purpose: the shape fit that follows reads the
+            // window's position, and must see it on the new monitor.
+            SetWindowPos(hwnd, nullptr, target.work.left + 40, target.work.top + 40, 0, 0,
                          SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             qDebug() << "[mirror] moved to monitor" << index + 1;
         } else {
@@ -1135,6 +1252,8 @@ QWidget *MainWindow::buildHomePage() {
     layout->addWidget(lede);
     layout->addSpacing(16);
 
+    layout->addWidget(buildUpdateCard());
+
     // --- status ---
     auto *hero = new QFrame();
     hero->setObjectName("hero");
@@ -1170,6 +1289,9 @@ QWidget *MainWindow::buildHomePage() {
         // between the last repaint and the click.
         if (m_bonjourMissing) {
             installBonjourService();
+        } else if (m_engineFailed && !m_running) {
+            hideNotice();
+            restartEngineNow();
         } else if (m_running && isSessionActive()) {
             restartEngineNow();
         } else {
@@ -1310,6 +1432,12 @@ void MainWindow::updateHome() {
             sub = "Bonjour Service is not installed, so devices cannot find this PC.";
             action = "Install Bonjour";
             primary = true;
+        } else if (m_engineFailed && !m_running) {
+            state = "error";
+            title = "AirPlay could not start";
+            sub = m_engineError;
+            action = "Retry";
+            primary = true;
         } else if (!m_running) {
             state = "stopped";
             title = "AirPlay is stopped";
@@ -1319,8 +1447,11 @@ void MainWindow::updateHome() {
         } else if (isSessionActive()) {
             state = "live";
             title = "Mirroring";
-            sub = "A device is connected. Disconnecting restarts the receiver, "
-                  "which takes about a second.";
+            sub = m_videoSize.isValid()
+                      ? QString("Receiving %1 x %2. Disconnecting restarts the receiver.")
+                            .arg(m_videoSize.width()).arg(m_videoSize.height())
+                      : QString("A device is connected. Disconnecting restarts the receiver, "
+                                "which takes about a second.");
             action = "Disconnect";
         } else {
             state = "ready";
@@ -1364,6 +1495,300 @@ void MainWindow::updateHome() {
             card->setChecked(card->property("preset").toString() == current);
         }
         if (m_presetNote) m_presetNote->setVisible(current.isEmpty());
+    }
+}
+
+// --- Updates ---------------------------------------------------------------
+
+static QString formatBytes(qint64 bytes) {
+    if (bytes < 1024 * 1024) return QString("%1 KB").arg(qMax<qint64>(1, bytes / 1024));
+    return QString("%1 MB").arg(bytes / double(1024 * 1024), 0, 'f', 1);
+}
+
+static QString describeWhen(const QDateTime &utc) {
+    if (!utc.isValid()) return QString();
+    const QDateTime local = utc.toLocalTime();
+    const qint64 seconds = local.secsTo(QDateTime::currentDateTime());
+    if (seconds < 60) return QStringLiteral("just now");
+    if (seconds < 3600) return QString("%1 min ago").arg(seconds / 60);
+    if (local.date() == QDate::currentDate()) return "today at " + local.toString("HH:mm");
+    return local.toString("d MMM yyyy");
+}
+
+void MainWindow::showHomePage() {
+    showSettingsWindow();
+    if (m_sectionList) m_sectionList->setCurrentRow(0);
+}
+
+QWidget *MainWindow::buildUpdateCard() {
+    // Wrapped so the gap below the card disappears with it.
+    m_updateBox = new QWidget();
+    auto *boxLayout = new QVBoxLayout(m_updateBox);
+    boxLayout->setContentsMargins(0, 0, 0, 12);
+
+    auto *card = new QFrame();
+    card->setObjectName("updateCard");
+    auto *cardLayout = new QHBoxLayout(card);
+    cardLayout->setContentsMargins(16, 14, 16, 12);
+    cardLayout->setSpacing(14);
+
+    m_updateIcon = new QLabel(QString(QChar(0xE896)));  // Download
+    m_updateIcon->setObjectName("updateIcon");
+    m_updateIcon->setAlignment(Qt::AlignCenter);
+    const QStringList families = QFontDatabase::families();
+    QFont iconFont(families.contains("Segoe Fluent Icons")
+                       ? QStringLiteral("Segoe Fluent Icons")
+                       : QStringLiteral("Segoe MDL2 Assets"));
+    iconFont.setPixelSize(18);
+    m_updateIcon->setFont(iconFont);
+    cardLayout->addWidget(m_updateIcon, 0, Qt::AlignTop);
+
+    auto *column = new QVBoxLayout();
+    column->setSpacing(3);
+    m_updateTitle = new QLabel();
+    m_updateTitle->setObjectName("updateTitle");
+    m_updateSub = new QLabel();
+    m_updateSub->setObjectName("updateSub");
+    m_updateSub->setWordWrap(true);
+    column->addWidget(m_updateTitle);
+    column->addWidget(m_updateSub);
+
+    m_updateProgress = new QProgressBar();
+    m_updateProgress->setTextVisible(false);
+    m_updateProgress->setRange(0, 1000);
+    column->addSpacing(4);
+    column->addWidget(m_updateProgress);
+
+    auto *buttons = new QHBoxLayout();
+    buttons->setContentsMargins(0, 6, 0, 0);
+    buttons->setSpacing(4);
+    m_updateNotes = new QPushButton("What's new");
+    m_updateNotes->setObjectName("link");
+    m_updateNotes->setCursor(Qt::PointingHandCursor);
+    connect(m_updateNotes, &QPushButton::clicked, this, [this]() {
+        const QString page = m_updater->release().pageUrl;
+        if (!page.isEmpty()) QDesktopServices::openUrl(QUrl(page));
+    });
+    m_updateSkip = new QPushButton("Skip this version");
+    m_updateSkip->setObjectName("link");
+    m_updateSkip->setCursor(Qt::PointingHandCursor);
+    connect(m_updateSkip, &QPushButton::clicked, this, [this]() {
+        QSettings().setValue("update_skipped_version",
+                             m_updater->release().version.toString());
+        updateUpdateUi();
+    });
+    m_updatePrimary = new QPushButton();
+    connect(m_updatePrimary, &QPushButton::clicked, this, &MainWindow::onUpdatePrimaryAction);
+
+    buttons->addWidget(m_updateNotes);
+    buttons->addWidget(m_updateSkip);
+    buttons->addStretch(1);
+    buttons->addWidget(m_updatePrimary);
+    column->addLayout(buttons);
+
+    cardLayout->addLayout(column, 1);
+    boxLayout->addWidget(card);
+
+    m_updateBox->setVisible(false);
+    return m_updateBox;
+}
+
+void MainWindow::onUpdatePrimaryAction() {
+    using State = UpdateChecker::State;
+    switch (m_updater->state()) {
+        case State::Available:
+        case State::Failed:
+            if (m_updater->canInstallInPlace()) {
+                m_updater->download();
+            } else if (!m_updater->release().pageUrl.isEmpty()) {
+                // Portable copy, or a release with no verifiable installer:
+                // the release page is the honest way to update.
+                QDesktopServices::openUrl(QUrl(m_updater->release().pageUrl));
+            }
+            break;
+
+        case State::Downloading:
+            m_updater->cancelDownload();
+            break;
+
+        case State::Ready: {
+            if (isSessionActive()) {
+                const int choice = QMessageBox::question(
+                    this, "Install update",
+                    "A device is mirroring right now. Installing the update closes "
+                    "XMirror and disconnects it.\n\nInstall now?",
+                    QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+                if (choice != QMessageBox::Yes) return;
+            }
+            // The installer replaces files this process holds open, so XMirror
+            // steps aside as soon as it has started.
+            if (m_updater->launchInstaller()) quit();
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+void MainWindow::updateUpdateUi() {
+    if (!m_updater) return;
+    using State = UpdateChecker::State;
+
+    const State state = m_updater->state();
+    const UpdateRelease &release = m_updater->release();
+    const QString available = release.version.toString();
+    const QString current = UpdateChecker::currentVersionString();
+    const bool hasRelease = !release.version.isNull() &&
+                            (state == State::Available || state == State::Downloading ||
+                             state == State::Ready || state == State::Failed);
+    const bool skipped = state == State::Available &&
+                         QSettings().value("update_skipped_version").toString() == available;
+    const bool offered = hasRelease && !skipped;
+
+    // --- Home card ---
+    if (m_updateBox) {
+        m_updateBox->setVisible(offered);
+
+        QString iconState;
+        QString title;
+        QString sub;
+        QString primary;
+        bool primaryAccent = true;
+        bool showProgress = false;
+        bool showSkip = false;
+
+        switch (state) {
+            case State::Available: {
+                title = QString("XMirror %1 is available").arg(available);
+                sub = QString("You have %1").arg(current);
+                if (release.published.isValid()) {
+                    sub += " · released " + release.published.toLocalTime().toString("d MMM yyyy");
+                }
+                if (m_updater->canInstallInPlace()) {
+                    sub += ".";
+                    primary = "Update";
+                } else {
+                    sub += ". Download it from the release page.";
+                    primary = "Get update";
+                }
+                showSkip = true;
+                break;
+            }
+            case State::Downloading: {
+                title = QString("Downloading XMirror %1").arg(available);
+                const qint64 total = m_updater->bytesTotal();
+                const qint64 received = m_updater->bytesReceived();
+                sub = total > 0
+                          ? QString("%1 of %2").arg(formatBytes(received), formatBytes(total))
+                          : formatBytes(received);
+                m_updateProgress->setValue(total > 0 ? int(received * 1000 / total) : 0);
+                primary = "Cancel";
+                primaryAccent = false;
+                showProgress = true;
+                break;
+            }
+            case State::Ready:
+                title = QString("XMirror %1 is ready to install").arg(available);
+                sub = isSessionActive()
+                          ? "Installing closes XMirror and disconnects the device that is mirroring."
+                          : "Verified. XMirror closes while the installer runs.";
+                primary = "Install now";
+                break;
+            case State::Failed:
+                iconState = "error";
+                title = QString("Updating to %1 did not finish").arg(available);
+                sub = m_updater->errorText();
+                primary = "Try again";
+                showSkip = true;
+                break;
+            default:
+                break;
+        }
+
+        if (offered) {
+            m_updateTitle->setText(title);
+            m_updateSub->setText(sub);
+            m_updatePrimary->setText(primary);
+            m_updateProgress->setVisible(showProgress);
+            m_updateSkip->setVisible(showSkip);
+            m_updateNotes->setVisible(!release.pageUrl.isEmpty());
+
+            if (m_updateIcon->property("state").toString() != iconState) {
+                m_updateIcon->setProperty("state", iconState);
+                m_updateIcon->setText(QString(QChar(iconState == "error" ? 0xE7BA : 0xE896)));
+                repolish(m_updateIcon);
+            }
+            const QString name = primaryAccent ? QStringLiteral("primary") : QString();
+            if (m_updatePrimary->objectName() != name) {
+                m_updatePrimary->setObjectName(name);
+                repolish(m_updatePrimary);
+            }
+        }
+    }
+
+    // --- tray ---
+    if (m_updateTrayAction) {
+        m_updateTrayAction->setVisible(offered);
+        m_updateTrayAction->setText(state == State::Ready
+                                        ? QString("Install XMirror %1...").arg(available)
+                                        : QString("Update to XMirror %1...").arg(available));
+    }
+
+    // One notification per version, and only when the window is not already
+    // showing the card.
+    if (state == State::Available && !skipped && m_tray) {
+        QSettings settings;
+        if (settings.value("update_notified_version").toString() != available) {
+            settings.setValue("update_notified_version", available);
+            if (!isVisible()) {
+                m_updateBalloonShown = true;
+                m_tray->showMessage("XMirror update available",
+                                    QString("Version %1 is ready to download. Click to see it.")
+                                        .arg(available),
+                                    QSystemTrayIcon::Information, 8000);
+            }
+        }
+    }
+
+    // --- Behaviour page status ---
+    if (m_updateStatus) {
+        const QString checked = describeWhen(m_updater->lastChecked());
+        QString text;
+        switch (state) {
+            case State::Idle:
+                text = checked.isEmpty() ? "Not checked yet." : "Last checked " + checked + ".";
+                break;
+            case State::Checking:
+                text = "Checking for updates...";
+                break;
+            case State::UpToDate:
+                text = release.version.isNull()
+                           ? "Up to date. No release has been published yet."
+                           : "Up to date.";
+                if (!checked.isEmpty()) text += " Checked " + checked + ".";
+                break;
+            case State::Available:
+                text = QString("Version %1 is available.").arg(available);
+                if (skipped) text += " You chose to skip it.";
+                break;
+            case State::Downloading:
+                text = QString("Downloading version %1...").arg(available);
+                break;
+            case State::Ready:
+                text = QString("Version %1 is downloaded and ready to install.").arg(available);
+                break;
+            case State::Failed:
+                text = hasRelease
+                           ? QString("Updating to %1 did not finish: %2").arg(available, m_updater->errorText())
+                           : "Could not check for updates: " + m_updater->errorText();
+                break;
+        }
+        m_updateStatus->setText(text);
+    }
+    if (m_checkNowButton) {
+        m_checkNowButton->setEnabled(state != State::Checking && state != State::Downloading &&
+                                     state != State::Ready);
     }
 }
 
@@ -1464,6 +1889,17 @@ void MainWindow::setupUI() {
 
     connect(m_sectionList, &QListWidget::currentRowChanged,
             m_sectionStack, &QStackedWidget::setCurrentIndex);
+    // The current section is bold as well as filled, so it reads without
+    // relying on colour. Item views take weight from the item, not the
+    // stylesheet.
+    connect(m_sectionList, &QListWidget::currentRowChanged, this, [this](int row) {
+        for (int i = 0; i < m_sectionList->count(); ++i) {
+            QListWidgetItem *item = m_sectionList->item(i);
+            QFont font = item->font();
+            font.setWeight(i == row ? QFont::DemiBold : QFont::Normal);
+            item->setFont(font);
+        }
+    });
     m_sectionList->setCurrentRow(0);
 
     root->addWidget(body, 1);
@@ -1528,6 +1964,10 @@ void MainWindow::setupTray() {
 
     m_trayMenu->addAction("Settings...", this, &MainWindow::showSettingsWindow);
 
+    // Only visible while an update is on offer.
+    m_updateTrayAction = m_trayMenu->addAction("Update available", this, &MainWindow::showHomePage);
+    m_updateTrayAction->setVisible(false);
+
     // Stopping the server was previously impossible from the tray, despite the
     // README claiming otherwise.
     m_toggleServerAction =
@@ -1540,6 +1980,13 @@ void MainWindow::setupTray() {
     m_tray->setContextMenu(m_trayMenu);
     
     connect(m_tray, &QSystemTrayIcon::activated, this, &MainWindow::onTrayActivated);
+    // The tray has one balloon slot shared with engine errors, so only a click
+    // on our own notification opens Home.
+    connect(m_tray, &QSystemTrayIcon::messageClicked, this, [this]() {
+        if (!m_updateBalloonShown) return;
+        m_updateBalloonShown = false;
+        showHomePage();
+    });
     m_tray->show();
 }
 
@@ -1759,6 +2206,8 @@ void MainWindow::applyRendererAndFullscreenArgs(QStringList &args) {
 
 void MainWindow::startServer() {
     if (m_worker && m_worker->isRunning()) return;
+    m_engineFailed = false;
+    m_engineError.clear();
 
     QString appData = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(appData);
@@ -1941,6 +2390,8 @@ void MainWindow::tryAdoptMirrorWindow() {
     qDebug() << "[mirror] window adopted, retitled and given the app icon";
 
     applyMirrorWindowPreferences();
+    installMirrorWindowControls();
+    fitMirrorWindowToVideo();
 
     // Sample the window rectangle while the session is alive; the sink destroys
     // its window without warning, so reading it at the end is too late.
@@ -1957,6 +2408,64 @@ void MainWindow::tryAdoptMirrorWindow() {
     if (m_mirrorFallbackTimer) m_mirrorFallbackTimer->stop();
 }
 
+// --- Picture shape -------------------------------------------------------------
+// The window-level work lives in mirrorshape.cpp; this is the policy: when to
+// fit, what the lock is set to, and keeping the settings switch in step.
+
+bool MainWindow::mirrorAspectLocked() const {
+    return QSettings().value("mirror_lock_aspect", true).toBool();
+}
+
+void MainWindow::setMirrorAspectLock(bool locked) {
+    QSettings().setValue("mirror_lock_aspect", locked);
+    MirrorShape::setLocked(m_mirrorHwnd, locked);
+
+    if (FluentSwitch *toggle = m_switches.value("mirror_lock_aspect")) {
+        QSignalBlocker blocker(toggle);
+        toggle->setChecked(locked);
+    }
+    if (locked) fitMirrorWindowToVideo();  // locking removes any bars straight away
+}
+
+void MainWindow::onVideoSizeChanged(int width, int height) {
+    if (width <= 0 || height <= 0) return;
+
+    const QSize size(width, height);
+    if (size == m_videoSize) return;  // the client repeats it, not only on changes
+
+    qDebug() << "[mirror] picture size" << width << "x" << height;
+    m_videoSize = size;
+    MirrorShape::setAspect(double(width) / double(height));
+
+    fitMirrorWindowToVideo();
+    updateStatus();
+}
+
+void MainWindow::installMirrorWindowControls() {
+    // The menu toggle arrives on GStreamer's window thread.
+    MirrorShape::install(m_mirrorHwnd, mirrorAspectLocked(), [](bool locked) {
+        if (MainWindow *window = g_mainWindow) {
+            QMetaObject::invokeMethod(
+                window, [window, locked]() { window->setMirrorAspectLock(locked); },
+                Qt::QueuedConnection);
+        }
+    });
+    if (m_videoSize.isValid()) {
+        MirrorShape::setAspect(double(m_videoSize.width()) / double(m_videoSize.height()));
+    }
+}
+
+void MainWindow::releaseMirrorWindowControls() {
+    MirrorShape::release(m_mirrorHwnd);
+}
+
+void MainWindow::fitMirrorWindowToVideo() {
+    if (!m_mirrorHwnd || !m_videoSize.isValid() || !mirrorAspectLocked()) return;
+    if (MirrorShape::fit(m_mirrorHwnd, m_videoSize.width(), m_videoSize.height())) {
+        qDebug() << "[mirror] fitted window to" << m_videoSize;
+    }
+}
+
 void MainWindow::forgetMirrorWindow() {
     // Take one last sample before dropping the handle.
     QSettings settings;
@@ -1965,8 +2474,10 @@ void MainWindow::forgetMirrorWindow() {
     }
     if (m_mirrorGeometryTimer) m_mirrorGeometryTimer->stop();
 
+    releaseMirrorWindowControls();
     m_mirrorHwnd = nullptr;
     m_mirrorFallbackTicks = 0;
+    m_videoSize = QSize();
 }
 
 void MainWindow::onAirplayStopped() {
@@ -1989,21 +2500,39 @@ void MainWindow::onAirplayStopped() {
             m_applyWhenIdle = false;
             updateDeferralBar();
         }
-        qDebug() << "Session ended, restarting server to stay ready...";
-        QTimer::singleShot(1000, this, &MainWindow::startServer);
+        if (m_engineFailed) {
+            // It would fail the same way again. Retry, or fixing the setting
+            // that caused it, starts it deliberately.
+            qDebug() << "Engine stopped with an error; not restarting automatically";
+        } else {
+            qDebug() << "Session ended, restarting server to stay ready...";
+            QTimer::singleShot(1000, this, &MainWindow::startServer);
+        }
     }
 }
 
 void MainWindow::onAirplayError(const QString &message) {
+    m_engineFailed = true;
+    m_engineError = message;
+
     // A three-second tray balloon is easy to miss, and this is the one message
-    // that explains why nothing works. Put it where it stays.
-    showNotice("AirPlay engine error: " + message, "Retry", [this]() {
-        hideNotice();
-        restartEngineNow();
-    });
-    if (m_tray) {
-        m_tray->showMessage("XMirror", message, QSystemTrayIcon::Warning, 5000);
+    // that explains why nothing works. Put it where it stays, with the action
+    // most likely to fix it.
+    if (message.contains("arguments.txt")) {
+        showNotice("AirPlay could not start. " + message, "Edit arguments.txt", [this]() {
+            openSettingsFile();
+        });
+    } else {
+        showNotice("AirPlay could not start. " + message, "Retry", [this]() {
+            hideNotice();
+            restartEngineNow();
+        });
     }
+    if (m_tray) {
+        m_tray->showMessage("XMirror", "AirPlay could not start. " + message,
+                            QSystemTrayIcon::Warning, 8000);
+    }
+    updateStatus();
 }
 
 void MainWindow::toggleAutostart(bool checked) {
@@ -2197,7 +2726,7 @@ void MainWindow::resetSettingsToDefaults() {
         "fps_limit", "rotation", "keep_window", "audio_latency_ms", "vsync_ms",
         "vsync_set", "audio_mode", "volume_pct", "taper", "no_audio", "screensaver",
         "reset_secs", "fps_data", "ble_enabled",
-        "remember_geometry", "target_monitor", "always_on_top",
+        "remember_geometry", "target_monitor", "always_on_top", "mirror_lock_aspect",
         "mirror_x", "mirror_y", "mirror_w", "mirror_h",
     };
     for (const QString &key : engineKeys) settings.remove(key);
@@ -2244,8 +2773,17 @@ void MainWindow::updateStatus() {
         status = "Discovery unavailable - Bonjour not installed";
         dotState = "error";
     } else if (m_running) {
-        status = isSessionActive() ? "Mirroring" : "Waiting for a device";
+        if (!isSessionActive()) {
+            status = "Waiting for a device";
+        } else if (m_videoSize.isValid()) {
+            status = QString("Mirroring %1 x %2").arg(m_videoSize.width()).arg(m_videoSize.height());
+        } else {
+            status = "Mirroring";
+        }
         if (isSessionActive()) dotState = "live";
+    } else if (m_engineFailed) {
+        status = "AirPlay could not start";
+        dotState = "error";
     } else {
         status = "AirPlay stopped";
     }
@@ -2273,6 +2811,7 @@ void MainWindow::updateStatus() {
     }
 
     updateHome();
+    updateUpdateUi();
 }
 
 bool MainWindow::isWindowsServicePresent(const std::wstring& serviceName) const {

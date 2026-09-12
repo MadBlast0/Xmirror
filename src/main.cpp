@@ -22,8 +22,12 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <filesystem>
+#include <shlobj.h>
 
 #include "airplayworker.h"
+#include "xmirror_api.h"
 #endif
 
 #ifdef _WIN32
@@ -89,6 +93,107 @@ static void soakOut(const char *fmt, ...) {
         fflush(g_soakLog);
     }
     fflush(stdout);
+}
+
+// --test-engine-errors : runs broken configurations through the real worker and
+// checks that each ends as an error the app can show -- not as the process
+// exiting -- and that a pipeline the PC cannot run falls back to software
+// decoding. Writes engine-errors-report.txt next to the exe. Exit code 0 = pass.
+static std::mutex g_noticeMutex;
+static QString g_lastNotice;
+
+static int runEngineErrorTest() {
+    const QString logPath =
+        QDir(QApplication::applicationDirPath()).filePath("engine-errors-report.txt");
+    FILE *log = _wfopen(reinterpret_cast<const wchar_t *>(
+                            QDir::toNativeSeparators(logPath).utf16()), L"w");
+    int failures = 0;
+    const auto say = [log](const QString &line) {
+        const QByteArray bytes = (line + "\n").toUtf8();
+        fputs(bytes.constData(), stdout);
+        if (log) { fputs(bytes.constData(), log); fflush(log); }
+    };
+
+    xmirror_set_notice_callback([](const char *message) {
+        std::lock_guard<std::mutex> lock(g_noticeMutex);
+        g_lastNotice = QString::fromUtf8(message);
+    });
+
+    // Replaces the value of `flag` in the shipped arguments, or appends it.
+    const auto withOption = [](QStringList args, const QString &flag, const QString &value) {
+        const int at = args.indexOf(flag);
+        if (at >= 0 && at + 1 < args.size()) {
+            args[at + 1] = value;
+        } else {
+            args << flag << value;
+        }
+        return args;
+    };
+
+    struct Case {
+        QString name;
+        QStringList args;
+        bool expectError;
+        QString expectText;  // in the error, or in the notice when no error
+    };
+    const QStringList shipped = xMirrorDefaultArguments();
+    const QList<Case> cases = {
+        {"option missing its value", QStringList{"-n"}, true, "\"-n\""},
+        {"command-line-only option", QStringList{"-h"}, true, "only works on the command line"},
+        {"unknown option", QStringList{"-no-such-option"}, true, "arguments.txt"},
+        {"bad resolution", QStringList{"-s", "huge"}, true, "\"-s\""},
+        {"unusable decoder falls back to software", withOption(shipped, "-vd", "nosuchdecoder"),
+         false, "software"},
+        {"unbuildable parser fails cleanly", withOption(shipped, "-vp", "nosuchparser"),
+         true, "video pipeline could not start"},
+    };
+
+    for (const Case &test : cases) {
+        {
+            std::lock_guard<std::mutex> lock(g_noticeMutex);
+            g_lastNotice.clear();
+        }
+        QString error;
+        bool gotError = false;
+        AirPlayWorker worker;
+        QObject::connect(&worker, &AirPlayWorker::errorOccurred, &worker,
+                         [&](const QString &message) { error = message; gotError = true; },
+                         Qt::DirectConnection);
+        worker.setArgs(test.args);
+        worker.start();
+
+        // An error returns quickly; a working engine keeps running until told.
+        const bool finishedAlone = worker.wait(test.expectError ? 20000 : 6000);
+        if (!finishedAlone) {
+            worker.requestStop();
+            if (!worker.wait(20000)) {
+                worker.terminate();
+                worker.wait(1000);
+            }
+        }
+
+        QString notice;
+        {
+            std::lock_guard<std::mutex> lock(g_noticeMutex);
+            notice = g_lastNotice;
+        }
+
+        bool pass;
+        if (test.expectError) {
+            pass = gotError && error.contains(test.expectText, Qt::CaseInsensitive);
+        } else {
+            pass = !gotError && !finishedAlone && notice.contains(test.expectText, Qt::CaseInsensitive);
+        }
+        if (!pass) ++failures;
+        say(QString("%1  %2").arg(pass ? "PASS" : "FAIL", test.name));
+        if (gotError) say("      error:  " + error);
+        if (!notice.isEmpty()) say("      notice: " + notice);
+    }
+
+    xmirror_set_notice_callback(nullptr);
+    say(QString("\n%1 failure(s); the process is still running, so nothing called exit().").arg(failures));
+    if (log) fclose(log);
+    return failures ? 1 : 0;
 }
 
 static int runEngineSoakTest(int cycles, int settleMs) {
@@ -350,7 +455,65 @@ static void migrateLegacyUserData() {
     }
 }
 
+#ifdef _WIN32
+// --remove-user-data: run by the installer on a real uninstall, never on an
+// upgrade, as the uninstalling user. Deletes everything XMirror writes outside
+// its install folder: QSettings, arguments.txt, the theme cache and any
+// downloaded update, under the current and both earlier brand names.
+//
+// It lives here rather than as declarative MSI rules because Windows Installer
+// runs RemoveRegistryKey/RemoveFile rules whenever a component is removed --
+// and a major upgrade removes the old product first. Those rules wiped every
+// user's settings on every update.
+//
+// Pure Win32, before any Qt object exists: it must not show UI or claim the
+// single-instance mutex from inside an installer.
+static int removeUserData() {
+    namespace fs = std::filesystem;
+
+    for (const wchar_t *key : {L"Software\\MadBlast\\XMirror",
+                               L"Software\\MadBlast\\MadMirror",
+                               L"Software\\MadBlast\\Mad-AirPlay"}) {
+        RegDeleteTreeW(HKEY_CURRENT_USER, key);
+    }
+    RegDeleteKeyW(HKEY_CURRENT_USER, L"Software\\MadBlast");  // only once empty
+
+    // Known folders come from the process token, so they resolve to the
+    // uninstalling user even though the installer's own environment may not.
+    const auto knownFolder = [](REFKNOWNFOLDERID id) {
+        fs::path path;
+        PWSTR raw = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(id, 0, nullptr, &raw))) path = raw;
+        CoTaskMemFree(raw);
+        return path;
+    };
+
+    std::error_code ignored;
+    for (const fs::path &root : {knownFolder(FOLDERID_RoamingAppData),
+                                 knownFolder(FOLDERID_LocalAppData)}) {
+        if (root.empty()) continue;
+        const fs::path org = root / L"MadBlast";
+        for (const wchar_t *app : {L"XMirror", L"MadMirror", L"Mad-AirPlay"}) {
+            fs::remove_all(org / app, ignored);
+        }
+        fs::remove(org, ignored);  // removes the directory only if now empty
+    }
+
+    wchar_t temp[MAX_PATH + 1];
+    if (GetTempPathW(MAX_PATH + 1, temp)) {
+        fs::remove_all(fs::path(temp) / L"XMirror-update", ignored);
+    }
+    return 0;
+}
+#endif
+
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--remove-user-data") == 0) return removeUserData();
+    }
+#endif
+
 #ifdef _WIN32
     // --log <path> sends everything the engine and the GUI print to a file.
     //
@@ -432,6 +595,12 @@ int main(int argc, char *argv[]) {
     if (app.arguments().contains("--self-test")) {
         return runRuntimeSelfTest(appPath);
     }
+
+#ifdef _WIN32
+    if (app.arguments().contains("--test-engine-errors")) {
+        return runEngineErrorTest();
+    }
+#endif
 
 #ifdef _WIN32
     // --soak-test [cycles]  Engine stop/start regression test. Runs headless and

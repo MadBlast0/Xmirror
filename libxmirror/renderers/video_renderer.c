@@ -225,7 +225,30 @@ GstElement *make_video_sink(const char *videosink, const char *videosink_options
     return video_sink;
 }
 
-void video_renderer_init(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char * rtp_pipeline,
+/* Frees whatever a failed video_renderer_init() had built, leaving every slot
+ * NULL so a later init or destroy starts from nothing. */
+static void abandon_renderers(int count) {
+    for (int j = 0; j < count && j < NCODECS; j++) {
+        if (!renderer_type[j]) continue;
+        if (renderer_type[j]->pipeline) {
+            gst_element_set_state(renderer_type[j]->pipeline, GST_STATE_NULL);
+            if (renderer_type[j]->appsrc) gst_object_unref(renderer_type[j]->appsrc);
+            if (renderer_type[j]->textsrc) gst_object_unref(renderer_type[j]->textsrc);
+            if (renderer_type[j]->bus) gst_object_unref(renderer_type[j]->bus);
+            gst_object_unref(renderer_type[j]->pipeline);
+        }
+        if (renderer_type[j]->uri) free(renderer_type[j]->uri);
+        free(renderer_type[j]);
+        renderer_type[j] = NULL;
+    }
+    n_renderers = 0;
+    renderer = NULL;
+}
+
+/* Returns false, with nothing left allocated, if a pipeline cannot be built or
+ * cannot reach READY. The standalone program exited here; embedded in XMirror
+ * that took the whole application down, so the caller now decides. */
+bool video_renderer_init(logger_t *render_logger, const char *server_name, videoflip_t videoflip[2], const char *parser, const char * rtp_pipeline,
                           const char *decoder, const char *converter, const char *videosink, const char *videosink_options, 
                           bool initial_fullscreen, bool video_sync, bool h265_support, bool coverart_support, guint playbin_version, const char *uri) {
     GError *error = NULL;
@@ -401,8 +424,20 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                                "           or some requested part of GStreamer is not installed\n");
                 }
                 g_clear_error (&error);
+                /* gst_parse_launch returns a partial pipeline for a missing element
+                 * (a typo, or d3d11h264dec on a GPU that cannot decode H.264). It
+                 * reaches READY but never shows video, so treat it as a failure. */
+                if (renderer_type[i]->pipeline) {
+                    gst_object_unref(renderer_type[i]->pipeline);
+                    renderer_type[i]->pipeline = NULL;
+                }
             }
-            g_assert (renderer_type[i]->pipeline);
+            if (!renderer_type[i]->pipeline) {
+                g_string_free(launch, TRUE);
+                gst_caps_unref(caps);
+                abandon_renderers(i + 1);
+                return false;
+            }
             GstClock *clock = gst_system_clock_obtain();
             g_object_set(clock, "clock-type", GST_CLOCK_TYPE_REALTIME, NULL);
             gst_pipeline_use_clock(GST_PIPELINE_CAST(renderer_type[i]->pipeline), clock);
@@ -461,9 +496,11 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                        "\nor your choices of video options (-vs -vd -vc -fs etc.) are incompatible on"
                        "\nthis computer architecture.  (An example: kmssink with fullscreen option -fs"
                        "\nmay work on some systems, but fail on others)");
-            exit(1);
+            abandon_renderers(i + 1);
+            return false;
         }
     }
+    return true;
 }
 
 void video_renderer_pause() {
@@ -746,8 +783,13 @@ void video_renderer_destroy() {
     for (int i = 0; i < n_renderers; i++) {
         if (renderer_type[i]) {
             video_renderer_destroy_instance(renderer_type[i]);
+            /* destroy_instance frees the renderer but can only clear its own
+             * parameter; clear the slot so nothing reuses a freed pointer. */
+            renderer_type[i] = NULL;
         }
     }
+    n_renderers = 0;
+    renderer = NULL;
 }
 
 static void get_stream_status_name(GstStreamStatusType type, char *name, size_t len) {

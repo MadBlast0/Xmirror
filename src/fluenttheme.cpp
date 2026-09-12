@@ -6,10 +6,7 @@
 #include <QPalette>
 #include <QDir>
 #include <QHash>
-#include <QOperatingSystemVersion>
-#include <QPointer>
 #include <QRegularExpression>
-#include <QWidget>
 #include <QImage>
 #include <QPainter>
 #include <QSettings>
@@ -18,9 +15,6 @@
 #include <QStyleHints>
 
 #include <cmath>
-
-#include <windows.h>
-#include <dwmapi.h>
 
 namespace {
 
@@ -105,7 +99,7 @@ struct Palette {
     QString infoBg, infoFg, infoLine;
     QString ok, scroll;
     QString swTrack, swTrackHover, swBorder, swKnob, disabled;
-    QString popup, cardHover;
+    QString popup, cardHover, railSel;
 };
 
 Palette paletteFor(bool dark) {
@@ -121,7 +115,7 @@ Palette paletteFor(bool dark) {
         p.ok = "#6ccb5f";    p.scroll = "#4a4a4a";
         p.swTrack = "#272727"; p.swTrackHover = "#313131";
         p.swBorder = "#9a9a9e"; p.swKnob = "#cfcfd4"; p.disabled = "#4a4a4a";
-        p.popup = "#2b2b2b"; p.cardHover = "#323232";
+        p.popup = "#2b2b2b"; p.cardHover = "#323232"; p.railSel = "#383838";
     } else {
         p.bg = "#f3f3f3";  p.card = "#fbfbfb";  p.cardLine = "#e8e8ea";
         p.line = "#e2e2e5"; p.fg = "#1b1b1f";   p.mut = "#5d5d63";
@@ -133,39 +127,9 @@ Palette paletteFor(bool dark) {
         p.ok = "#0f7b0f";    p.scroll = "#c4c4c8";
         p.swTrack = "#ffffff"; p.swTrackHover = "#f0f0f0";
         p.swBorder = "#8a8a8f"; p.swKnob = "#5d5d63"; p.disabled = "#c8c8cc";
-        p.popup = "#fbfbfb"; p.cardHover = "#f6f6f7";
+        p.popup = "#fbfbfb"; p.cardHover = "#f6f6f7"; p.railSel = "#dddde0";
     }
     return p;
-}
-
-// Acrylic variant. Surfaces that sit directly on the window become transparent so
-// the material shows; cards and fields keep enough fill to stay legible over
-// any wallpaper. Popups (p.popup) are untouched -- they are separate windows
-// with no material behind them, and a translucent fill there reads as black.
-void applyBackdrop(Palette &p, bool dark) {
-    p.bg = "transparent";
-    p.swTrack = "transparent";
-    if (dark) {
-        p.card = "rgba(255, 255, 255, 13)";  p.cardLine = "rgba(255, 255, 255, 18)";
-        p.cardHover = "rgba(255, 255, 255, 22)";
-        p.line = "rgba(255, 255, 255, 20)";  p.hover = "rgba(255, 255, 255, 14)";
-        p.sel = "rgba(255, 255, 255, 24)";
-        p.field = "rgba(255, 255, 255, 18)"; p.fieldLine = "rgba(255, 255, 255, 30)";
-        p.fieldHover = "rgba(255, 255, 255, 26)";
-        p.btn = "rgba(255, 255, 255, 20)";   p.btnHover = "rgba(255, 255, 255, 30)";
-        p.warnBg = "rgba(67, 53, 25, 200)";  p.infoBg = "rgba(29, 43, 54, 190)";
-        p.swTrackHover = "rgba(255, 255, 255, 18)";
-    } else {
-        p.card = "rgba(255, 255, 255, 160)"; p.cardLine = "rgba(0, 0, 0, 16)";
-        p.cardHover = "rgba(255, 255, 255, 200)";
-        p.line = "rgba(0, 0, 0, 20)";        p.hover = "rgba(255, 255, 255, 110)";
-        p.sel = "rgba(255, 255, 255, 190)";
-        p.field = "rgba(255, 255, 255, 215)"; p.fieldLine = "rgba(0, 0, 0, 30)";
-        p.fieldHover = "rgba(255, 255, 255, 240)";
-        p.btn = "rgba(255, 255, 255, 200)";  p.btnHover = "rgba(255, 255, 255, 235)";
-        p.warnBg = "rgba(255, 244, 206, 215)"; p.infoBg = "rgba(234, 243, 251, 205)";
-        p.swTrackHover = "rgba(255, 255, 255, 120)";
-    }
 }
 
 QString rgba(const QColor &c, int alpha) {
@@ -186,15 +150,14 @@ QToolTip {
 QListWidget#rail {
   background: $bg; border: none; outline: none; padding: 8px;
 }
+/* The current section is a plain grey fill and bold text, with no accent
+   stripe or outline. */
 QListWidget#rail::item {
-  padding: 8px 10px; margin: 1px 0px; border-radius: 6px; color: $fg;
-  border: 1px solid transparent; border-left: 3px solid transparent;
+  padding: 9px 12px; margin: 1px 0px; border: none; border-radius: 6px;
+  color: $fg;
 }
 QListWidget#rail::item:hover { background: $hover; }
-QListWidget#rail::item:selected {
-  background: $sel; color: $fg;
-  border: 1px solid $cardLine; border-left: 3px solid $accent;
-}
+QListWidget#rail::item:selected { background: $railSel; color: $fg; font-weight: 600; }
 
 /* --- pages --- */
 QScrollArea { background: $bg; border: none; }
@@ -334,6 +297,27 @@ QPushButton#presetCard QLabel { background: transparent; }
 QLabel#presetTitle { font-size: 10pt; font-weight: 600; color: $fg; }
 QLabel#presetDesc { font-size: 9pt; color: $mut; }
 
+/* --- update card --- */
+QFrame#updateCard { background: $card; border: 1px solid $accent; border-radius: 8px; }
+QFrame#updateCard QLabel { background: transparent; }
+QFrame#updateCard QLabel#updateIcon {
+  background: $accentSoft; color: $accent; border-radius: 10px;
+  min-width: 40px; max-width: 40px; min-height: 40px; max-height: 40px;
+}
+QFrame#updateCard QLabel#updateIcon[state="error"] { background: $warnBg; color: $warnFg; }
+QLabel#updateTitle { font-size: 11pt; font-weight: 600; color: $fg; }
+QLabel#updateSub { font-size: 9pt; color: $mut; }
+QProgressBar {
+  background: $hover; border: none; border-radius: 2px;
+  min-height: 4px; max-height: 4px;
+}
+QProgressBar::chunk { background: $accent; border-radius: 2px; }
+QPushButton#link {
+  background: transparent; border: none; color: $accent; padding: 6px 6px;
+}
+QPushButton#link:hover { color: $accentHover; }
+QPushButton#link:pressed { color: $mut; }
+
 /* --- the toggle's palette, so it is not duplicated in C++ --- */
 FluentSwitch {
   qproperty-accentColor: $accent;
@@ -383,28 +367,11 @@ void applyPalette(bool dark, const QColor &accent) {
     QApplication::setPalette(p);
 }
 
-bool g_backdrop = false;
-QList<QPointer<QWidget>> g_backdropWindows;
-
-// The material takes its light or dark tint from the window's immersive
-// dark-mode flag, not from the app's colours, so the flag has to follow the
-// system too.
-void setWindowDarkMode(QWidget *window, bool dark) {
-    const HWND hwnd = reinterpret_cast<HWND>(window->winId());
-    const BOOL value = dark ? TRUE : FALSE;
-    DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */,
-                          &value, sizeof(value));
-}
-
 void apply() {
     const bool dark = FluentTheme::systemPrefersDark();
     const QColor accent = FluentTheme::systemAccent(dark);
     applyPalette(dark, accent);
-    qApp->setStyleSheet(FluentTheme::styleSheet(dark, accent, g_backdrop));
-
-    for (const QPointer<QWidget> &window : std::as_const(g_backdropWindows)) {
-        if (window) setWindowDarkMode(window, dark);
-    }
+    qApp->setStyleSheet(FluentTheme::styleSheet(dark, accent));
 }
 
 }  // namespace
@@ -433,18 +400,16 @@ QColor FluentTheme::systemAccent(bool dark) {
     return legibleAccent(accent, dark);
 }
 
-QString FluentTheme::styleSheet(bool dark, const QColor &accent, bool backdrop) {
-    const Palette solid = paletteFor(dark);
-    Palette p = solid;
-    if (backdrop) applyBackdrop(p, dark);
+QString FluentTheme::styleSheet(bool dark, const QColor &accent) {
+    const Palette p = paletteFor(dark);
     const QColor accentHover = dark ? accent.lighter(112) : accent.darker(108);
 
     const QString chevronDown =
         writeChevron(dark ? "chevron-down-dark" : "chevron-down-light",
-                     QColor(solid.mut), false);
+                     QColor(p.mut), false);
     const QString chevronUp =
         writeChevron(dark ? "chevron-up-dark" : "chevron-up-light",
-                     QColor(solid.mut), true);
+                     QColor(p.mut), true);
 
     const QHash<QString, QString> tokens = {
         {"chevronDown", chevronDown}, {"chevronUp", chevronUp},
@@ -455,7 +420,7 @@ QString FluentTheme::styleSheet(bool dark, const QColor &accent, bool backdrop) 
         {"bg", p.bg}, {"card", p.card}, {"cardLine", p.cardLine},
         {"cardHover", p.cardHover}, {"popup", p.popup},
         {"line", p.line}, {"fg", p.fg}, {"mut", p.mut},
-        {"hover", p.hover}, {"sel", p.sel},
+        {"hover", p.hover}, {"sel", p.sel}, {"railSel", p.railSel},
         {"field", p.field}, {"fieldLine", p.fieldLine}, {"fieldHover", p.fieldHover},
         {"btn", p.btn}, {"btnHover", p.btnHover},
         {"warnBg", p.warnBg}, {"warnFg", p.warnFg}, {"warnLine", p.warnLine},
@@ -507,48 +472,4 @@ void FluentTheme::install() {
     QObject::connect(QGuiApplication::styleHints(),
                      &QStyleHints::colorSchemeChanged, qApp,
                      [](Qt::ColorScheme) { apply(); });
-}
-
-bool FluentTheme::enableAcrylic(QWidget *window) {
-    // DWMWA_SYSTEMBACKDROP_TYPE arrived in Windows 11 22H2 (build 22621).
-    // Earlier builds accept the call and silently do nothing, which on a
-    // translucent window would leave it see-through, so gate on the build.
-    const QOperatingSystemVersion os = QOperatingSystemVersion::current();
-    if (os.type() != QOperatingSystemVersion::Windows || os.microVersion() < 22621) {
-        return false;
-    }
-    if (window->testAttribute(Qt::WA_WState_Created)) {
-        qWarning() << "[theme] enableAcrylic() called after the window was created; ignored.";
-        return false;
-    }
-
-    window->setAttribute(Qt::WA_TranslucentBackground, true);
-    const HWND hwnd = reinterpret_cast<HWND>(window->winId());
-
-    // A negative margin extends the frame over the whole client area, which is
-    // what lets the material show behind Qt's transparent pixels.
-    const MARGINS margins{-1, -1, -1, -1};
-    // DWMSBT_TRANSIENTWINDOW, i.e. Acrylic: a blur of whatever is behind the
-    // window. Mica (2) samples only the wallpaper and reads near-solid on a
-    // dark or neutral one, which was too subtle for this design.
-    const int backdrop = 3;
-    const bool ok =
-        SUCCEEDED(DwmExtendFrameIntoClientArea(hwnd, &margins)) &&
-        SUCCEEDED(DwmSetWindowAttribute(hwnd, 38 /* DWMWA_SYSTEMBACKDROP_TYPE */,
-                                        &backdrop, sizeof(backdrop)));
-    if (!ok) {
-        // The window is already translucent. Keeping the solid stylesheet
-        // (g_backdrop stays false) paints an opaque background over it.
-        qWarning() << "[theme] DWM refused the Acrylic backdrop; using solid surfaces.";
-        return false;
-    }
-
-    g_backdropWindows.append(window);
-    g_backdrop = true;
-    apply();
-    return true;
-}
-
-bool FluentTheme::backdropActive() {
-    return g_backdrop;
 }

@@ -2,12 +2,14 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
      
-  <!-- version number is major.minor.zero.enginebuild -->
+  <!-- version number is major.minor.patch.enginebuild. major.minor.patch comes
+       from the VERSION file via build.ps1; MSI upgrades ignore the fourth
+       field, so every release must change one of the first three. -->
   <Package
     Id="XMirror"
     Name="XMirror"
     Manufacturer="MadBlast"
-    Version="2.1.0.1736"
+    Version="$(var.ProductVersion).1736"
     UpgradeCode="00000eaf-dcca-458f-ab77-aaef11ce4ba8"
     Language="1033"
     Scope="perMachine">
@@ -47,8 +49,6 @@
       <ComponentGroupRef Id="AppExe" />
       <ComponentRef Id="ProgramMenuShortcutComponent" />
       <ComponentRef Id="UserDataCleanupComponent" />
-      <ComponentRef Id="LegacyMadMirrorCleanupComponent" />
-      <ComponentRef Id="LegacyMadAirPlayCleanupComponent" />
     </Feature>
 
     <Feature
@@ -116,29 +116,27 @@
     <!-- ================= uninstall cleanup =================
          Settings live in HKCU\Software\MadBlast\<app name> (QSettings) and
          %APPDATA%\MadBlast\<app name>\arguments.txt. Neither is installed by
-         the MSI, so without these rules both survive an uninstall and a
-         reinstall silently inherits stale configuration.
+         the MSI, so XMirror.exe removes them itself through its
+         remove-user-data switch (RemoveUserData, below), on a real uninstall.
+
+         Not with RemoveRegistryKey/RemoveFile rules, as earlier versions did:
+         Windows Installer runs those whenever the component is removed, and a
+         major upgrade removes the old product before installing the new one,
+         so every update wiped every setting. A custom action can be
+         conditioned on NOT UPGRADINGPRODUCTCODE; those rules cannot.
 
          Caveat worth knowing: this is a perMachine package, so HKCU and
          %APPDATA% resolve to the *uninstalling* user only. Other users'
          settings on the same machine are not reachable from here; that is an
          MSI limitation, not an oversight. -->
 
-    <StandardDirectory Id="AppDataFolder">
-      <Directory Id="AppDataOrgDir" Name="MadBlast">
-        <Directory Id="AppDataAppDir" Name="XMirror" />
-        <!-- Directories left behind by the earlier brand names. The registry
-             equivalents are handled by RemoveRegistryKey below. -->
-        <Directory Id="AppDataLegacyMadMirror" Name="MadMirror" />
-        <Directory Id="AppDataLegacyMadAirPlay" Name="Mad-AirPlay" />
-      </Directory>
-    </StandardDirectory>
-
+    <!-- Registry-only now, so it no longer sits in a profile directory. A new
+         GUID because its directory changed; safe, as major upgrades remove the
+         old product in full before installing this one. -->
     <Component Id="UserDataCleanupComponent"
-               Guid="7c1d4a90-2f6e-4b31-9d84-5a0e3c77b118"
-               Directory="AppDataAppDir">
-      <!-- HKCU keypath: required for a per-user component, and it is itself
-           removed by the RemoveRegistryKey rules below. -->
+               Guid="34f124f5-c95d-4c27-838e-0c2710ed40cd"
+               Directory="INSTALLDIR">
+      <!-- HKCU keypath: required for a per-user component. -->
       <RegistryValue
         Root="HKCU"
         Key="Software\MadBlast\XMirror"
@@ -151,56 +149,25 @@
            (verified twice, with the Icon Id spelled both .exe and .ico), so
            write the value directly and point it at the installed executable,
            whose own embedded icon Windows will then render. Removed with the
-           product because it lives under this component. -->
+           product because it lives under this component. The app also reads
+           it to recognise an MSI installation when offering updates. -->
       <RegistryValue
         Root="HKLM"
         Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\[ProductCode]"
         Name="DisplayIcon"
         Type="string"
         Value="[INSTALLDIR]XMirror.exe" />
-
-      <!-- arguments.txt plus the .legacy/.bak siblings the app may leave. -->
-      <RemoveFile Id="RemoveUserArguments" Name="*" On="uninstall" />
-      <RemoveFolder Id="RemoveUserAppDir" On="uninstall" />
-      <RemoveFolder Id="RemoveUserOrgDir"
-                    Directory="AppDataOrgDir"
-                    On="uninstall" />
-
-      <!-- Current and every previously shipped application name. -->
-      <RemoveRegistryKey Root="HKCU"
-                         Key="Software\MadBlast\XMirror"
-                         Action="removeOnUninstall" />
-      <RemoveRegistryKey Root="HKCU"
-                         Key="Software\MadBlast\MadMirror"
-                         Action="removeOnUninstall" />
-      <RemoveRegistryKey Root="HKCU"
-                         Key="Software\MadBlast\Mad-AirPlay"
-                         Action="removeOnUninstall" />
     </Component>
 
-    <!-- Directories from the earlier brand names. Separate components because a
-         RemoveFile/RemoveFolder pair can only target the component's own
-         directory. AppDataOrgDir itself is removed by UserDataCleanupComponent,
-         which succeeds only once these have emptied it. -->
-    <Component Id="LegacyMadMirrorCleanupComponent"
-               Guid="b4e8f2a1-6c39-4d57-8e02-1f7a9c4d3e65"
-               Directory="AppDataLegacyMadMirror">
-      <RegistryValue Root="HKCU" Key="Software\MadBlast\XMirror"
-                     Name="LegacyMadMirrorCleanup" Type="integer" Value="1"
-                     KeyPath="yes" />
-      <RemoveFile Id="RemoveLegacyMadMirrorFiles" Name="*" On="uninstall" />
-      <RemoveFolder Id="RemoveLegacyMadMirrorDir" On="uninstall" />
-    </Component>
-
-    <Component Id="LegacyMadAirPlayCleanupComponent"
-               Guid="c9a71d34-58b2-4e60-9f18-2d6b0e5a7c43"
-               Directory="AppDataLegacyMadAirPlay">
-      <RegistryValue Root="HKCU" Key="Software\MadBlast\XMirror"
-                     Name="LegacyMadAirPlayCleanup" Type="integer" Value="1"
-                     KeyPath="yes" />
-      <RemoveFile Id="RemoveLegacyMadAirPlayFiles" Name="*" On="uninstall" />
-      <RemoveFolder Id="RemoveLegacyMadAirPlayDir" On="uninstall" />
-    </Component>
+    <!-- Impersonated, so it runs as the uninstalling user and reaches their
+         HKCU and profile. Before RemoveFiles, while XMirror.exe still exists.
+         Return="ignore": leftover settings must never block an uninstall. -->
+    <CustomAction Id="RemoveUserData"
+                  Directory="INSTALLDIR"
+                  ExeCommand="&quot;[INSTALLDIR]XMirror.exe&quot; --remove-user-data"
+                  Execute="deferred"
+                  Impersonate="yes"
+                  Return="ignore" />
 
     <!-- Unregister the bundled Bonjour service so no auto-start service is left
          pointing at a deleted INSTALLDIR. Runs as SYSTEM (deferred, not
@@ -230,6 +197,11 @@
       <Custom Action="UnregisterBonjourService"
               Before="RemoveFiles"
               Condition="REMOVE=&quot;ALL&quot;" />
+      <!-- A real uninstall only. During a major upgrade the old product is
+           also removed with REMOVE=ALL, but UPGRADINGPRODUCTCODE is set. -->
+      <Custom Action="RemoveUserData"
+              Before="RemoveFiles"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <!-- After InstallFiles so mDNSResponder.exe is on disk to be run. -->
       <Custom Action="RegisterBonjourService"
               After="InstallFiles"

@@ -238,9 +238,53 @@ static float previous_hls_position = 0.0f;
 
 /* logging */
 
+/* ---- errors that end the engine, not the application ---------------------
+ * XMirror embeds this engine as a library. The standalone program's exit()
+ * calls took the whole application down with no explanation, so fatal errors
+ * on the engine's own thread throw EngineExit instead: start_xmirror() catches
+ * it, keeps the reason for xmirror_last_error(), and returns. Never thrown from
+ * callbacks, which run under C frames. */
+struct EngineExit {
+    int code;
+    std::string reason;
+};
+static std::string engine_error;       /* reason for the last failed start */
+static std::string last_logged_error;  /* most recent LOGE text, for detail */
+static std::atomic<xmirror_notice_callback> notice_callback{nullptr};
+static std::atomic<bool> video_pipeline_failed{false};
+
+[[noreturn]] static void engine_fail(const std::string &reason) {
+    throw EngineExit{1, reason};
+}
+
+static std::string option_error(const std::string &option) {
+    std::string reason = "The option \"" + option + "\" in arguments.txt is not valid";
+    if (!last_logged_error.empty()) reason += " (" + last_logged_error + ")";
+    return reason + ".";
+}
+
+static void notify_user(const std::string &message) {
+    if (xmirror_notice_callback callback = notice_callback.load()) callback(message.c_str());
+}
+
+const char *xmirror_last_error(void) {
+    return engine_error.c_str();
+}
+
+void xmirror_set_notice_callback(xmirror_notice_callback callback) {
+    notice_callback.store(callback);
+}
+
 static void log(int level, const char* format, ...) {
     va_list vargs;
     if (level > log_level) return;
+    if (level <= LOGGER_ERR) {
+        char text[512];
+        va_start(vargs, format);
+        vsnprintf(text, sizeof(text), format, vargs);
+        va_end(vargs);
+        last_logged_error = text;
+    }
     switch (level) {
     case 0:
     case 1:
@@ -1216,7 +1260,8 @@ static void parse_arguments (int argc, char *argv[]) {
         if (!is_utf8(argv[i], NULL)) {
             fprintf(stderr,"Error: detected a non-ascii or non-UTF-8 string \"%s\""
                     "while parsing input arguments", argv[i]);
-            exit(0);
+            engine_fail(std::string("arguments.txt contains text that is not valid UTF-8: \"") +
+                        argv[i] + "\".");
         }
     }
     for (int i = 1; i < argc; i++) {
@@ -1224,11 +1269,11 @@ static void parse_arguments (int argc, char *argv[]) {
         if (arg == "-rc") {
             i++;  //specifies startup file: has already been processed
         } else if (arg == "-allow") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) engine_fail(option_error(arg));
             i++;
             allowed_clients.push_back(argv[i]);
         } else if (arg == "-block") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) engine_fail(option_error(arg));
             i++;
             blocked_clients.push_back(argv[i]);    
         } else if (arg == "-restrict") {
@@ -1241,14 +1286,14 @@ static void parse_arguments (int argc, char *argv[]) {
 	    } 
             restrict_clients = true;
         } else if (arg == "-n") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) engine_fail(option_error(arg));
             bool ascii;
             server_name_is_utf8 = false;
             server_name.erase();
             bool utf8 = is_utf8(argv[++i], &ascii);
             if (!utf8) {
                 fprintf(stderr, "invalid (non-UTF-8/ascii) server name in \"-n %s\"", argv[i]);
-                exit(1);
+                engine_fail(option_error(arg));
             }
             server_name = std::string(argv[i]);
             if (!ascii) {
@@ -1274,22 +1319,22 @@ static void parse_arguments (int argc, char *argv[]) {
                         audio_delay_alac = n * 1000; /* units are nsecs */
                     } else {
                         fprintf(stderr, "invalid -async %s: requested delays must be smaller than +/- 1000 millisecs\n", argv[i] );
-                        exit (1);
+                        engine_fail(option_error(arg));
                     }
                 }
             }
         } else if (arg == "-scrsv") {
-            if (!option_has_value(i, argc, argv[i], argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, argv[i], argv[i+1])) engine_fail(option_error(arg));
             unsigned int n = 0;
             if (!get_value(argv[++i], &n) || n > 2) {
                 fprintf(stderr, "invalid \"-scrsv %s\"; values 0, 1, 2 allowed\n", argv[i]);
-                exit(1);
+                engine_fail(option_error(arg));
             }
 #ifdef DBUS
             scrsv = n;
 #else
             fprintf(stderr,"invalid: option \"-scrsv\" is currently only implemented for Linux/*BSD systems with D-Bus service\n");
-            exit(1);
+            engine_fail(option_error(arg));
 #endif
         } else if (arg == "-vsync") {
             video_sync = true;
@@ -1307,39 +1352,39 @@ static void parse_arguments (int argc, char *argv[]) {
                         audio_delay_aac = n * 1000;     /* units are nsecs */
                     } else {
                         fprintf(stderr, "invalid -vsync %s: requested delays must be smaller than +/- 1000 millisecs\n", argv[i]);
-                        exit (1);
+                        engine_fail(option_error(arg));
                     }
                 }
             }
         } else if (arg == "-s") {
-            if (!option_has_value(i, argc, argv[i], argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, argv[i], argv[i+1])) engine_fail(option_error(arg));
             std::string value(argv[++i]);
             if (!get_display_settings(value, &display[0], &display[1], &display[2])) {
                 fprintf(stderr, "invalid \"-s %s\"; -s wxh : max w,h=9999; -s wxh@r : max r=255\n",
                         argv[i]);
-                exit(1);
+                engine_fail(option_error(arg));
             }
         } else if (arg == "-fps") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) engine_fail(option_error(arg));
             unsigned int n = 255;
             if (!get_value(argv[++i], &n)) {
                 fprintf(stderr, "invalid \"-fps %s\"; -fps n : max n=255, default n=30\n", argv[i]);
-                exit(1);
+                engine_fail(option_error(arg));
             }
             display[3] = (unsigned short) n;
         } else if (arg == "-o") {
             display[4] = 1;
         } else if (arg == "-f") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) engine_fail(option_error(arg));
             if (!get_videoflip(argv[++i], &videoflip[0])) {
                 fprintf(stderr,"invalid \"-f %s\" , unknown flip type, choices are H, V, I\n",argv[i]);
-                exit(1);
+                engine_fail(option_error(arg));
             }
         } else if (arg == "-r") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) engine_fail(option_error(arg));
             if (!get_videorotate(argv[++i], &videoflip[1])) {
                 fprintf(stderr,"invalid \"-r %s\" , unknown rotation  type, choices are R, L\n",argv[i]);
-                exit(1);
+                engine_fail(option_error(arg));
             }
         } else if (arg == "-p") {
             if (i == argc - 1 || argv[i + 1][0] == '-') {
@@ -1350,12 +1395,12 @@ static void parse_arguments (int argc, char *argv[]) {
             std::string value(argv[++i]);
             if (value == "tcp") {
                 arg.append(" tcp");
-                if(!get_ports(3, arg, argv[++i], tcp)) exit(1);
+                if(!get_ports(3, arg, argv[++i], tcp)) engine_fail(option_error(arg));
             } else if (value == "udp") {
                 arg.append( " udp");
-                if(!get_ports(3, arg, argv[++i], udp)) exit(1);
+                if(!get_ports(3, arg, argv[++i], udp)) engine_fail(option_error(arg));
             } else {
-                if(!get_ports(3, arg, argv[i], tcp)) exit(1);
+                if(!get_ports(3, arg, argv[i], tcp)) engine_fail(option_error(arg));
                 for (int j = 0; j < 3; j++) {
                     udp[j] = tcp[j];
                 }
@@ -1369,7 +1414,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 } else {
                     fprintf(stderr,"invalid mac address \"%s\": address must have form"
                             " \"xx:xx:xx:xx:xx:xx\", x = 0-9, A-F or a-f\n", argv[i]);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }
             } else {
                 use_random_hw_addr  = true;
@@ -1381,7 +1426,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 unsigned int n = 1;
                 if (!get_value(argv[++i], &n)) {
                     fprintf(stderr, "invalid \"-d %s\"; -d n : max n=1 (suppress packet data in debug output)\n", argv[i]);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }
                 debug_log = true;
                 suppress_packet_debug_data = true;
@@ -1390,25 +1435,25 @@ static void parse_arguments (int argc, char *argv[]) {
                 suppress_packet_debug_data = false;
             }
         } else if (arg == "-h"  || arg == "--help" || arg == "-?" || arg == "-help") {
-            print_info(argv[0]);
-            exit(0);
+            engine_fail("The option \"" + arg + "\" only works on the command line. "
+                        "Remove it from arguments.txt.");
         } else if (arg == "-v") {
-            printf("XMirror version %s; for help, use option \"-h\"\n", VERSION);
-            exit(0);
+            engine_fail("The option \"-v\" only works on the command line. "
+                        "Remove it from arguments.txt.");
         } else if (arg == "-vp") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) engine_fail(option_error(arg));
             video_parser.erase();
             video_parser.append(argv[++i]);
         } else if (arg == "-vd") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) engine_fail(option_error(arg));
             video_decoder.erase();
             video_decoder.append(argv[++i]);
         } else if (arg == "-vc") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) engine_fail(option_error(arg));
             video_converter.erase();
             video_converter.append(argv[++i]);
         } else if (arg == "-vs") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) engine_fail(option_error(arg));
             videosink.erase();
             videosink.append(argv[++i]);
             std::size_t pos = videosink.find(" ");
@@ -1418,13 +1463,13 @@ static void parse_arguments (int argc, char *argv[]) {
                 videosink.erase(pos);
             }
         } else if (arg == "-as") {
-            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            if (!option_has_value(i, argc, arg, argv[i+1])) engine_fail(option_error(arg));
             audiosink.erase();
             audiosink.append(argv[++i]);
         } else if (arg == "-t") {
             fprintf(stderr,"The xmirror option \"-t\" has been removed: it was a workaround for an  Avahi issue.\n");
             fprintf(stderr,"The correct solution is to open network port UDP 5353 in the firewall for mDNS queries\n");
-            exit(1);
+            engine_fail(option_error(arg));
         } else if (arg == "-nc") {
             new_window_closing_behavior = false;
             if (i <  argc - 1) {
@@ -1454,7 +1499,7 @@ static void parse_arguments (int argc, char *argv[]) {
             fprintf(stderr,"     -rpigl was equivalent to \"-v4l2 -vs glimagesink\"\n");
             fprintf(stderr,"     -rpiwl was equivalent to \"-v4l2 -vs waylandsink\"\n");
             fprintf(stderr,"     Option \"-bt709\" may also be needed for R Pi model 4B and earlier\n");
-            exit(1);
+            engine_fail(option_error(arg));
         } else if (arg == "-fs" ) {
             fullscreen = true;
         } else if (arg == "-FPSdata") {
@@ -1465,13 +1510,13 @@ static void parse_arguments (int argc, char *argv[]) {
             missed_feedback_limit = 0;
             if (!get_value(argv[++i], &missed_feedback_limit)) {
                 fprintf(stderr, "invalid \"-reset %s\"; -reset n must have n >= 0,  default n = %d seconds\n", argv[i], MISSED_FEEDBACK_LIMIT);
-                exit(1);
+                engine_fail(option_error(arg));
             }
 	} else if (arg == "-vrtp") {
 	  if (!option_has_value(i, argc, arg, argv[i+1])) {
 	    fprintf(stderr,"option \"-vrtp\" must be followed by a pipeline for sending the video stream:\n"
 		    "e.g., \"<rtph26[4,5]pay options> ! udpsink host=127.0.0.1 port -= 5000\"\n");
-	    exit(1);
+	    engine_fail(option_error(arg));
           }
 	  rtp_pipeline.erase();
 	  rtp_pipeline.append(argv[++i]);
@@ -1479,7 +1524,7 @@ static void parse_arguments (int argc, char *argv[]) {
 	  if (!option_has_value(i, argc, arg, argv[i+1])) {
 	    fprintf(stderr,"option \"-artp\" must be followed by a pipeline for sending the audio stream:\n"
 		    "e.g., \"<rtpL16pay options> ! udpsink host=127.0.0.1 port=5002\"\n");
-	    exit(1);
+	    engine_fail(option_error(arg));
           }
 	  audio_rtp_pipeline.erase();
 	  audio_rtp_pipeline.append(argv[++i]);
@@ -1490,7 +1535,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 if (get_value (argv[++i], &n)) {
                     if (n == 0) {
                         fprintf(stderr, "invalid \"-vdmp 0 %s\"; -vdmp n  needs a non-zero value of n\n", argv[i]);
-                        exit(1);
+                        engine_fail(option_error(arg));
                     }
                     video_dump_limit = n;
                     if (option_has_value(i, argc, arg, argv[i+1])) {
@@ -1504,7 +1549,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char *fn = video_dumpfile_name.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-vdmp <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }   		
             }
         } else if (arg == "-mp4"){
@@ -1515,7 +1560,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char *fn = mux_filename.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-mp4 <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }
             }
         } else if (arg == "-admp") {
@@ -1525,7 +1570,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 if (get_value (argv[++i], &n)) {
                     if (n == 0) {
                         fprintf(stderr, "invalid \"-admp 0 %s\"; -admp n  needs a non-zero value of n\n", argv[i]);
-                        exit(1);
+                        engine_fail(option_error(arg));
                     }
                     audio_dump_limit = n;
                     if (option_has_value(i, argc, arg, argv[i+1])) {
@@ -1539,7 +1584,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char *fn = audio_dumpfile_name.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-admp <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }
             }
         } else if (arg  == "-ca" ) {
@@ -1550,7 +1595,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 render_coverart = false;
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-ca <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }   
             } else {
                 render_coverart = true;
@@ -1562,11 +1607,11 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char *fn = metadata_filename.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-md <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }   
             } else {
                 fprintf(stderr,"option -md must be followed by a filename for metadata text output\n");
-                exit(1);
+                engine_fail(option_error(arg));
             }
         } else if (arg  == "-ble" ) {
             ble_filename.erase();
@@ -1576,7 +1621,7 @@ static void parse_arguments (int argc, char *argv[]) {
                     ble_filename.append(argv[i]);
                     if (!file_has_write_access(argv[i])) {
                         fprintf(stderr, "%s cannot be written to:\noption \"-ble<fn>\" must be to a file with write access\n", argv[i]);
-                        exit(1);
+                        engine_fail(option_error(arg));
                     }
                 }
             } else {
@@ -1586,11 +1631,11 @@ static void parse_arguments (int argc, char *argv[]) {
                     ble_filename.append("/.xmirror.ble");
                     if (!file_has_write_access(ble_filename.c_str())) {
                         fprintf(stderr, "%s cannot be written to\n",ble_filename.c_str()) ;
-                        exit(1);
+                        engine_fail(option_error(arg));
                     }
                 } else {
                     fprintf(stderr,"failed to obtain home directory\n");
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }
             }
         } else if (arg == "-bt709") {
@@ -1618,7 +1663,7 @@ static void parse_arguments (int argc, char *argv[]) {
             }
             fprintf(stderr, "invalid -al %s: value must be a decimal time offset in seconds, range [0,10]\n"
                     "(like 5 or 4.8, which will be converted to a whole number of microseconds)\n", argv[i]);
-            exit(1);
+            engine_fail(option_error(arg));
         } else if (arg == "-pin") {
             setup_legacy_pairing = true;
             pin_pw = 1;
@@ -1626,7 +1671,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 unsigned int n = 9999;
                 if (!get_value(argv[++i], &n)) {
                     fprintf(stderr, "invalid \"-pin %s\"; -pin nnnn : max nnnn=9999, (4 digits)\n", argv[i]);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }
                 pin = n + 10000;
             }
@@ -1638,7 +1683,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char * fn = pairing_register.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-reg <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }   
             }
         } else if (arg == "-key") {
@@ -1648,11 +1693,11 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char * fn = keyfile.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-key <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }   
             } else {
 	        //                fprintf(stderr, "option \"-key <fn>\" requires a path <fn> to a file for persistent key storage\n");
-	        // exit(1);
+	        // engine_fail(option_error(arg));
                 keyfile.erase();
                 keyfile.append("0");
             }
@@ -1664,7 +1709,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 pin_pw = 2;
                 if (password.size() < min_password_length) {
                     fprintf(stderr, "invalid client-access password \"%s\": length must be at least %u characters\n", password.c_str(), min_password_length);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }
             } else {
                 pin_pw = 3;  //a random password (pin) will be displayed at each connection
@@ -1676,7 +1721,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 const char *fn = dacpfile.c_str();
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-dacp <fn>\" must be to a file with write access\n", fn);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }   
             } else {
                 dacpfile.append(get_homedir());
@@ -1702,7 +1747,7 @@ static void parse_arguments (int argc, char *argv[]) {
             }
             if (db_bad) {
                 fprintf(stderr, "invalid \"-db  %s\": db value must be \"low\" or \"low:high\", low < 0 and high > low are decibel gains\n", argv[i+1]); 
-                exit(1);
+                engine_fail(option_error(arg));
             }
             i++;
             db_low = db1;
@@ -1731,7 +1776,7 @@ static void parse_arguments (int argc, char *argv[]) {
             }
             if (vol_bad) {
                 fprintf(stderr, "invalid \"-vol %s\", value must be between 0.0 (mute) and 1.0 (full volume)\n", argv[i+1]);
-                exit(1);
+                engine_fail(option_error(arg));
             }
             i++;
         } else if (arg == "-hls") {
@@ -1740,7 +1785,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 unsigned int n = 3;
                 if (!get_value(argv[++i], &n) || playbin_version < 2) {
                     fprintf(stderr, "invalid \"-hls %s\"; -hls n only allows \"playbin\" video player versions 2 or 3\n", argv[i]);
-                    exit(1);
+                    engine_fail(option_error(arg));
                 }
                 playbin_version = (guint) n;
             }
@@ -1755,7 +1800,7 @@ static void parse_arguments (int argc, char *argv[]) {
             nofreeze = true;
         } else {
             fprintf(stderr, "unknown option %s, stopping (for help use option \"-h\")\n",argv[i]);
-            exit(1);
+            engine_fail(option_error(arg));
         }
     }
 }
@@ -2132,6 +2177,76 @@ static bool check_blocked_client(char *deviceid) {
 
 //to be simplified
 
+/* Builds the video renderer. When the configured pipeline cannot start -- most
+ * often a PC or virtual machine without Direct3D 11 video decoding -- it retries
+ * with software decoding, then with an automatically chosen video output,
+ * instead of failing. The fallback that worked is remembered for as long as the
+ * configured video options stay the same, so the rebuild after every session
+ * goes straight to it; changing the options (e.g. fixing a typo in -vd) starts
+ * again from the configured pipeline. */
+static bool init_video_renderer(const char *uri) {
+    static int fallback_level = 0;       /* 0 as configured, 1 software decode, 2 + auto sink */
+    static bool user_told = false;
+    static std::string failed_config;    /* the options that needed a fallback */
+    static std::string fallback_config;  /* what they fell back to */
+
+    const auto current = []() {
+        return video_decoder + "|" + video_converter + "|" + videosink + "|" + videosink_options;
+    };
+    /* A start re-parses the options (so they read as failed_config again); a
+     * rebuild within the same run still holds the fallback. Anything else is a
+     * new configuration, which deserves a fresh attempt as configured. */
+    const std::string configured = current();
+    if (fallback_level > 0 && configured != failed_config && configured != fallback_config) {
+        fallback_level = 0;
+        user_told = false;
+    }
+
+    const auto apply_fallback = [](int level) {
+        if (level >= 1) {
+            video_decoder = "avdec_h264";      /* becomes avdec_h265 in the h265 pipeline */
+            video_converter = "videoconvert";
+        }
+        if (level >= 2) {
+            videosink = "autovideosink";
+            videosink_options.erase();
+        }
+    };
+    const auto attempt = [uri]() {
+        return video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),
+                                   rtp_pipeline.c_str(), video_decoder.c_str(), video_converter.c_str(),
+                                   videosink.c_str(), videosink_options.c_str(), fullscreen, video_sync,
+                                   h265_support, render_coverart, playbin_version, uri);
+    };
+
+    if (configured == failed_config || configured == fallback_config) apply_fallback(fallback_level);
+    for (;;) {
+        if (attempt()) break;
+        if (fallback_level >= 2) return false;
+        if (fallback_level == 0) failed_config = configured;
+        ++fallback_level;
+        LOGW("the video pipeline could not start; retrying with %s",
+             fallback_level == 1 ? "software decoding" : "software decoding and an automatic video output");
+        apply_fallback(fallback_level);
+    }
+    if (fallback_level > 0) fallback_config = current();
+
+    if (fallback_level > 0 && !user_told) {
+        user_told = true;
+        notify_user(fallback_level == 1
+            ? "The configured video decoder could not start on this PC, so XMirror is decoding "
+              "video in software instead. Expect higher latency and CPU use."
+            : "The configured video decoder and video output could not start on this PC, so XMirror "
+              "is using software decoding and an automatic video output instead. Expect higher "
+              "latency and CPU use.");
+    }
+    return true;
+}
+
+static const char video_start_failure[] =
+    "The video pipeline could not start on this PC, even with software decoding. "
+    "Check the video options (-vd, -vc, -vs, -vp) in arguments.txt.";
+
 extern "C" void video_reset(void *cls, reset_type_t type) {
     switch (type) {
     case RESET_TYPE_NOHOLD:
@@ -2146,11 +2261,13 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
             video_renderer_stop();
            /* reset the video renderer immediately to avoid a timing issue if we wait for main_loop to reset */ 
             video_renderer_destroy();
-            video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
-                                video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                                videosink_options.c_str(), fullscreen, video_sync, h265_support,
-                                render_coverart, playbin_version, NULL);
-            video_renderer_start();
+            if (init_video_renderer(NULL)) {
+                video_renderer_start();
+            } else {
+                /* A callback thread cannot tear the engine down; ask the main loop to. */
+                video_pipeline_failed = true;
+                reset_loop = true;
+            }
             close_window = false;  // we already closed the window
         }
         preserve_connections = false; //we already closed all other connections
@@ -2489,9 +2606,20 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
     }
 }
 
+static std::atomic<xmirror_video_size_callback> video_size_callback{nullptr};
+
+void xmirror_set_video_size_callback(xmirror_video_size_callback callback) {
+    video_size_callback.store(callback);
+}
+
 extern "C" void video_report_size(void *cls, float *width_source, float *height_source, float *width, float *height) {
     if (use_video) {
         video_renderer_size(width_source, height_source, width, height);
+    }
+    /* The client sends these on every SPS/PPS packet, i.e. at session start and on
+     * each format change such as a rotation. Values are integers stored as floats. */
+    if (xmirror_video_size_callback callback = video_size_callback.load()) {
+        callback((int) *width, (int) *height, (int) *width_source, (int) *height_source);
     }
 }
 
@@ -2867,7 +2995,7 @@ static void read_config_file(const char * filename, const char * xmirror_name) {
         char **argv = (char **) malloc(sizeof(char*) * argc);
         if (argv == NULL) {
             printf("Memory allocation failure (argV)\n");
-            exit(1);
+            engine_fail("Out of memory while reading the configuration file.");
         }
         for (int i = 0; i < argc; i++) {
             argv[i] = (char *) options[i].c_str();
@@ -2890,7 +3018,7 @@ int start_xmirror (int argc, char *argv[]) {
 
 static void real_main (int argc, char *argv[]) {
 #else
-int start_xmirror (int argc, char *argv[]) {
+static int run_xmirror (int argc, char *argv[]) {
 #endif
     std::vector<char> server_hw_addr;
     std::string config_file = "";
@@ -2898,7 +3026,7 @@ int start_xmirror (int argc, char *argv[]) {
 #ifdef _WIN32
     if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
         LOGE("Could not set control handler");
-        exit(1);
+        engine_fail("The engine could not install its console control handler.");
     }
 #else
     signal(SIGINT, CtrlHandler);
@@ -2934,12 +3062,12 @@ int start_xmirror (int argc, char *argv[]) {
             struct stat sb;
             if (i+1 == argc) {
                 LOGE ("option -rc requires a filename  (-rc <filename>)");
-                exit(1);
+                engine_fail(option_error("-rc"));
             }
             rcfile = argv[i+1];
             if (stat(rcfile, &sb) == -1) {
                 LOGE("startup file %s specified by option -rc was not found", rcfile);
-                exit(0);
+                engine_fail(option_error("-rc"));
             }
             break;
         }
@@ -3144,7 +3272,8 @@ int start_xmirror (int argc, char *argv[]) {
 
     if (!gstreamer_init()) {
         LOGE ("stopping");
-        exit (1);
+        engine_fail("GStreamer could not be initialised. The XMirror installation may be damaged; "
+                    "reinstalling it should help.");
     }
 
     render_logger = logger_init();
@@ -3157,10 +3286,13 @@ int start_xmirror (int argc, char *argv[]) {
         LOGI("audio_disabled");
     }
     if (use_video) {
-        video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(), rtp_pipeline.c_str(),
-                            video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                            videosink_options.c_str(), fullscreen, video_sync, h265_support,
-                            render_coverart, playbin_version, NULL);
+        if (!init_video_renderer(NULL)) {
+            /* Nothing is listening yet, so unwinding here leaks nothing that matters. */
+            if (use_audio) audio_renderer_destroy();
+            logger_destroy(render_logger);
+            render_logger = NULL;
+            engine_fail(video_start_failure);
+        }
         video_renderer_start();
 #ifdef __OpenBSD__
     } else {
@@ -3245,12 +3377,23 @@ int start_xmirror (int argc, char *argv[]) {
         stop_raop_server();
         stop_dnssd();
         cleanup();
+        engine_error = "The AirPlay service could not be registered with Bonjour. "
+                       "Check that the Bonjour Service is installed and running.";
         return 1;
     }
     reconnect:
     compression_type = 0;
     close_window = new_window_closing_behavior;
     main_loop();
+    if (video_pipeline_failed) {
+        video_pipeline_failed = false;
+        LOGE("stopping: the video pipeline could not be rebuilt");
+        stop_raop_server();
+        stop_dnssd();
+        cleanup();
+        engine_error = video_start_failure;
+        return 1;
+    }
         if (do_shutdown) {
         LOGI("Stopping RAOP Server...");
         stop_raop_server();
@@ -3272,10 +3415,14 @@ int start_xmirror (int argc, char *argv[]) {
                 raop_remove_known_connections(raop);
             }
             const char *uri = (url.empty() ? NULL : url.c_str());
-            video_renderer_init(render_logger, server_name.c_str(), videoflip, video_parser.c_str(),rtp_pipeline.c_str(),
-                                video_decoder.c_str(), video_converter.c_str(), videosink.c_str(),
-                                videosink_options.c_str(), fullscreen, video_sync, h265_support,
-                                render_coverart, playbin_version, uri);
+            if (!init_video_renderer(uri)) {
+                LOGE("stopping: the video pipeline could not be rebuilt");
+                stop_raop_server();
+                stop_dnssd();
+                cleanup();
+                engine_error = video_start_failure;
+                return 1;
+            }
             full_video_reset = false;
             video_renderer_start();
         }
@@ -3298,6 +3445,21 @@ int start_xmirror (int argc, char *argv[]) {
     // a non-void function, which is undefined behaviour.
     return 0;
 }
+
+#ifndef __APPLE__
+int start_xmirror (int argc, char *argv[]) {
+    engine_error.clear();
+    last_logged_error.clear();
+    video_pipeline_failed = false;
+    try {
+        return run_xmirror(argc, argv);
+    } catch (const EngineExit &failure) {
+        engine_error = failure.reason;
+        LOGE("%s", failure.reason.c_str());
+        return failure.code;
+    }
+}
+#endif
 
 void stop_xmirror() {
     // Callable from a thread other than the one running the engine.

@@ -14,6 +14,7 @@
 #include <QFrame>
 #include <QHash>
 #include <QVector>
+#include <QSize>
 
 class QMenu;
 class QAction;
@@ -24,6 +25,8 @@ class QLineEdit;
 class QSpinBox;
 class AirPlayWorker;
 class FluentSwitch;
+class QProgressBar;
+class UpdateChecker;
 
 // The built-in low-latency argument line. Exposed so the --soak-test harness in
 // main.cpp exercises the engine with exactly the arguments the app ships with.
@@ -54,6 +57,18 @@ public:
     // -> engine restart. Returns true if the engine is running again after.
     bool testApplyEngineChange();
     bool engineRunning() const { return m_running; }
+
+    // Also reached from the mirror window's title-bar menu, which runs on a
+    // GStreamer thread and posts here.
+    void setMirrorAspectLock(bool locked);
+
+    // A persistent explanation strip at the top of the window, used for things
+    // the user must see and act on. Unlike a tray balloon it does not vanish
+    // after three seconds. Also reached from engine notices.
+    void showNotice(const QString &text,
+                    const QString &actionText = QString(),
+                    std::function<void()> action = nullptr);
+    void hideNotice();
 
 protected:
     void closeEvent(QCloseEvent *event) override;
@@ -101,10 +116,6 @@ private:
     // A persistent explanation strip at the top of the window, used for things
     // the user must see and act on. Unlike a tray balloon it does not vanish
     // after three seconds.
-    void showNotice(const QString &text,
-                    const QString &actionText = QString(),
-                    std::function<void()> action = nullptr);
-    void hideNotice();
 
     // A machine-wide arguments.txt is deliberate administrator policy. Controls
     // whose flags it pins are disabled rather than silently overridden.
@@ -133,6 +144,20 @@ private:
     // cost the zero-copy path.
     void applyMirrorWindowPreferences();
     void rememberMirrorWindowGeometry();
+
+    // --- picture shape ----------------------------------------------------
+    // The client reports the picture size at connect and on every rotation.
+    // With the aspect lock on, the mirror window is sized to that shape and
+    // held to it while resizing, so there are no black bars. Unlocked, the
+    // window resizes freely. Toggled from the mirror window's own title-bar
+    // menu or from the Window settings page.
+    void onVideoSizeChanged(int width, int height);
+    void fitMirrorWindowToVideo();
+    void installMirrorWindowControls();
+    void releaseMirrorWindowControls();
+    bool mirrorAspectLocked() const;
+
+    QSize m_videoSize;  // current picture size; empty when unknown
 
     QTimer *m_mirrorGeometryTimer = nullptr;
 
@@ -217,6 +242,29 @@ private:
     QVector<QPushButton *> m_presetCards;
     QLabel *m_presetNote = nullptr;
 
+    // --- updates ------------------------------------------------------------
+    // A card at the top of Home, a tray item and notification, and a status
+    // row on the Behaviour page, all driven by one UpdateChecker. The check
+    // runs in the background shortly after launch.
+    QWidget *buildUpdateCard();
+    void updateUpdateUi();
+    void onUpdatePrimaryAction();
+    void showHomePage();
+
+    UpdateChecker *m_updater = nullptr;
+    QWidget *m_updateBox = nullptr;
+    QLabel *m_updateIcon = nullptr;
+    QLabel *m_updateTitle = nullptr;
+    QLabel *m_updateSub = nullptr;
+    QProgressBar *m_updateProgress = nullptr;
+    QPushButton *m_updatePrimary = nullptr;
+    QPushButton *m_updateNotes = nullptr;
+    QPushButton *m_updateSkip = nullptr;
+    QLabel *m_updateStatus = nullptr;      // Behaviour page row description
+    QPushButton *m_checkNowButton = nullptr;
+    QAction *m_updateTrayAction = nullptr;
+    bool m_updateBalloonShown = false;     // the last tray balloon was ours
+
     // --- apply engine -----------------------------------------------------
     // Settings that map to engine arguments need the engine restarted, because
     // start_xmirror() reads its configuration exactly once. Restarting is cheap
@@ -260,4 +308,10 @@ private:
 
     bool m_running = false;
     bool m_quitting = false;
+
+    // Set when the engine stopped with an error. Restarting it automatically
+    // would only fail again every second, so it waits for Retry (or a settings
+    // change) instead.
+    bool m_engineFailed = false;
+    QString m_engineError;
 };

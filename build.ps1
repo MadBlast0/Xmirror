@@ -55,6 +55,13 @@ $bonjourSdk = Join-Path $projectRoot "Bonjour SDK"
 $featuresFile = Join-Path $projectRoot "packaging\gstreamer-features.txt"
 $wixCacheDir = Join-Path $projectRoot ".wix"
 
+# The same VERSION file CMakeLists.txt reads, so the MSI and the app's update
+# check always agree on what version this is.
+$productVersion = (Get-Content -LiteralPath (Join-Path $projectRoot "VERSION") -TotalCount 1).Trim()
+if ($productVersion -notmatch '^\d+\.\d+\.\d+$') {
+    throw "VERSION must be major.minor.patch, got '$productVersion'"
+}
+
 function Invoke-Native {
     param(
         [Parameter(Mandatory = $true)]
@@ -591,6 +598,7 @@ function Build-Artifacts {
                 "-acceptEula", "wix7",
                 (Join-Path $projectRoot "product.wxs"),
                 "-arch", $architectureConfig.WixArchitecture,
+                "-d", "ProductVersion=$productVersion",
                 "-out", $msi,
                 "-pdbtype", "none",
                 "-ext", "WixToolset.UI.wixext"
