@@ -7,6 +7,7 @@
 # Local repository metadata and IDE files
 .idea/
 .vs/
+.vscode/
 
 # Bundled SDK and generated Windows artifacts
 Bonjour SDK/
@@ -28,3 +29,4 @@ __pycache__/
 .backup-phase0/
 soak-report.txt
 apply-report.txt
+engine-errors-report.txt
