@@ -174,12 +174,6 @@ jobs:
             exit 1
           fi
 
-      - name: write checksums
-        working-directory: dist
-        run: |
-          sha256sum XMirror-x64.msi XMirror-x64-portable.zip > SHA256SUMS.txt
-          cat SHA256SUMS.txt
-
       # Created as a draft, so it cannot become "latest" -- which is what every
       # installed copy's updater reads -- until the uploads are verified.
       - name: create draft release
@@ -191,11 +185,9 @@ jobs:
           - **XMirror-x64-portable.zip** -- no installation; unzip and run \`XMirror.exe\`. Portable copies do not update themselves.
 
           These builds are not code-signed yet, so Windows SmartScreen may warn when you run them: choose **More info** then **Run anyway**.
-
-          Checksums are in \`SHA256SUMS.txt\`.
           EOF
           gh release create "$TAG" \
-            dist/XMirror-x64.msi dist/XMirror-x64-portable.zip dist/SHA256SUMS.txt \
+            dist/XMirror-x64.msi dist/XMirror-x64-portable.zip \
             --draft \
             --verify-tag \
             --title "XMirror $VERSION" \

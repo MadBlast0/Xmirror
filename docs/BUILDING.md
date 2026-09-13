@@ -26,7 +26,7 @@ Releases are cut from `main` by pushing a version tag:
 
 The workflow checks that the tag is `v` plus exactly the contents of `VERSION`
 and that the commit is on `main`, builds the installer, uploads it to a draft
-release with a `SHA256SUMS.txt`, verifies GitHub published a matching sha256
+release, verifies GitHub published a matching sha256
 digest for each file, and only then publishes the release. Installed copies of
 XMirror find it through the in-app updater within a day.
 
