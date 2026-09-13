@@ -108,8 +108,18 @@ Output lands in `out\<arch>\artifacts` (portable ZIP + MSI).
 The version lives in `VERSION` (major.minor.patch) and nowhere else: CMake
 compiles it into the app as `XMIRROR_VERSION`, and `build.ps1` passes it to WiX.
 MSI major upgrades ignore a fourth version field, so every release must change
-one of the three. A tag-driven release build should write the tag into
-`VERSION` rather than override one side only.
+one of the three.
+
+## Releases
+
+`.github/workflows/release.yml` builds x64 only, unsigned, and only when asked:
+a `v*` tag publishes a GitHub Release; a manual run just uploads an artifact.
+Pushes and pull requests do not build. To release, commit the new `VERSION` to
+`main`, then push tag `v<VERSION>`. The workflow refuses a tag that does not
+equal `v` + `VERSION`, has a suffix, or is not on `main`. It publishes as a
+draft first and only makes the release "latest" after confirming GitHub's
+sha256 `digest` on `XMirror-x64.msi` matches the build -- the updater depends
+on both that asset name and that digest. `docs/BUILDING.md` has the steps.
 
 ## Updates
 

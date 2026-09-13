@@ -1,0 +1,222 @@
+name: release
+
+# Builds only when asked: pushing a v* tag publishes a GitHub Release, and a
+# manual run (Actions tab -> release -> Run workflow) builds the same package as
+# a downloadable artifact without publishing anything. Ordinary commits and pull
+# requests do not build.
+#
+# To release:
+#   1. Set VERSION to the new version (e.g. 0.2.0) and commit it to main.
+#   2. git tag v0.2.0 && git push origin v0.2.0
+#
+# Scope: x64 only, unsigned. arm64 is supported by build.ps1 but untested;
+# signing can be added as a step after the build without other changes.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# One run per ref, and a release run is never cancelled half-way.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build x64
+    runs-on: windows-2022
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+
+    steps:
+      - name: preserve shell script line endings
+        shell: powershell
+        run: git config --global core.autocrlf input
+
+      - name: check out repository
+        uses: actions/checkout@v5
+        with:
+          # Full history, so the tag can be checked against main below.
+          fetch-depth: 0
+
+      # The version is read from VERSION, never taken from the tag: a build of
+      # the same commit must report the same version wherever it is built. The
+      # tag has to agree, or the in-app updater would compare against the wrong
+      # number.
+      - name: check version and tag
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content -LiteralPath VERSION -TotalCount 1).Trim()
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "VERSION must be major.minor.patch, got '$version'."
+          }
+
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tag = $env:GITHUB_REF_NAME
+            if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+              throw "Release tags must look like v1.2.3 (no suffix); got '$tag'. The in-app updater ignores anything else."
+            }
+            if ($tag.Substring(1) -ne $version) {
+              throw "Tag $tag does not match VERSION ($version). Commit the new VERSION to main first, then tag that commit."
+            }
+            git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+            if ($LASTEXITCODE -ne 0) {
+              throw "Tag $tag points at a commit that is not on main. Releases are cut from main."
+            }
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "Building XMirror $version"
+
+      - name: restore Bonjour SDK cache
+        uses: actions/cache@v5
+        with:
+          path: Bonjour SDK
+          key: bonjour-x64-2881-${{ hashFiles('mdnsresponder-patches/2881.patch', 'scripts/build-bonjour.ps1') }}-v1
+
+      - name: set up MSYS2 UCRT64
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          cache: true
+
+      - name: set up native Windows Python for WinRT
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: packaging/python-requirements.txt
+
+      - name: set up .NET SDK for WiX
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: restore Pacman package archives
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.msys2.outputs.msys2-location }}\var\cache\pacman\pkg
+          key: pacman-UCRT64-${{ runner.os }}-${{ hashFiles('ucrt_x64_dependencies.txt') }}-v1
+          restore-keys: |
+            pacman-UCRT64-${{ runner.os }}-
+
+      - name: restore WiX NuGet cache
+        uses: actions/cache@v5
+        with:
+          path: out/x64/nuget-packages
+          key: wix-x64-${{ runner.os }}-${{ hashFiles('.config/dotnet-tools.json', 'NuGet.config') }}-v4
+
+      - name: build, bundle and verify
+        shell: powershell
+        env:
+          MSYS2_ROOT: ${{ steps.msys2.outputs.msys2-location }}
+        run: .\build.ps1 package -Architecture x64
+
+      # The in-app updater downloads exactly XMirror-x64.msi; a renamed or
+      # missing file would silently stop updates from working.
+      - name: check artifact names
+        shell: pwsh
+        run: |
+          foreach ($name in 'XMirror-x64.msi', 'XMirror-x64-portable.zip') {
+            $path = Join-Path 'out/x64/artifacts' $name
+            if (-not (Test-Path -LiteralPath $path)) { throw "Expected build output $name is missing." }
+            "{0,-28} {1,8:N1} MB" -f $name, ((Get-Item -LiteralPath $path).Length / 1MB)
+          }
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: XMirror-${{ steps.version.outputs.version }}-x64
+          path: |
+            out/x64/artifacts/XMirror-x64.msi
+            out/x64/artifacts/XMirror-x64-portable.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: publish release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.build.outputs.version }}
+
+    steps:
+      - name: download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: XMirror-${{ needs.build.outputs.version }}-x64
+          path: dist
+
+      - name: refuse to overwrite an existing release
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::A release for $TAG already exists. Delete it first, or release a new version."
+            exit 1
+          fi
+
+      - name: write checksums
+        working-directory: dist
+        run: |
+          sha256sum XMirror-x64.msi XMirror-x64-portable.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Created as a draft, so it cannot become "latest" -- which is what every
+      # installed copy's updater reads -- until the uploads are verified.
+      - name: create draft release
+        run: |
+          cat > notes.md <<EOF
+          ## Install
+
+          - **XMirror-x64.msi** -- installer. Existing installs also get this through the in-app updater.
+          - **XMirror-x64-portable.zip** -- no installation; unzip and run \`XMirror.exe\`. Portable copies do not update themselves.
+
+          These builds are not code-signed yet, so Windows SmartScreen may warn when you run them: choose **More info** then **Run anyway**.
+
+          Checksums are in \`SHA256SUMS.txt\`.
+          EOF
+          gh release create "$TAG" \
+            dist/XMirror-x64.msi dist/XMirror-x64-portable.zip dist/SHA256SUMS.txt \
+            --draft \
+            --verify-tag \
+            --title "XMirror $VERSION" \
+            --notes-file notes.md \
+            --generate-notes
+
+      # The updater refuses an installer without a GitHub-published sha256
+      # digest, so check the digest exists and matches what was built.
+      - name: verify uploaded assets
+        run: |
+          release_id=$(gh api "repos/$GH_REPO/releases" --jq ".[] | select(.tag_name == \"$TAG\") | .id")
+          if [ -z "$release_id" ]; then echo "::error::Draft release for $TAG not found."; exit 1; fi
+          for name in XMirror-x64.msi XMirror-x64-portable.zip; do
+            expected="sha256:$(sha256sum "dist/$name" | cut -d' ' -f1)"
+            actual=$(gh api "repos/$GH_REPO/releases/$release_id/assets" --jq ".[] | select(.name == \"$name\") | .digest")
+            echo "$name  expected $expected  published ${actual:-<none>}"
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::$name was not published with the expected sha256 digest; the release stays a draft."
+              exit 1
+            fi
+          done
+
+      - name: publish release
+        run: gh release edit "$TAG" --draft=false --latest
